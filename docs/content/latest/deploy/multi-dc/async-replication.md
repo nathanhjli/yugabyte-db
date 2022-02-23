@@ -143,11 +143,94 @@ When both universes use different certificates, you need to store the certificat
       127.0.0.1:7100,127.0.0.2:7100,127.0.0.3:7100 \
       000030a5000030008000000000004000,000030a5000030008000000000004005,dfef757c415c4b2cacc9315b8acb539a
     ```
-
-## Verifying Replication
-
 You can verify replication by stopping the workload and then using the `COUNT(*)` function on the yugabyte-target to yugabyte-source match.
+## Setting up Replication with Geo-partitioning
 
+Create 2 universes(source and target) with same configurations(with same regions and zones) as below
+
+For Example:
+* **Regions:** EU(Paris), Asia Pacific(Mumbai) and US West(Oregon)
+* **Zones:** eu-west-3a, ap-south-1a and us-west-2a
+
+```.sh
+./bin/yb-ctl --rf 3 create --placement_info "cloud1.region1.zone1,cloud2.region2.zone2"
+```
+
+For Example:
+```.sh
+./bin/yb-ctl --rf 3 create --placement_info "aws.us-west-2.us-west-2a,aws.ap-south-1.ap-south-1a,aws.eu-west-3.eu-west-3a"
+```
+
+Create table, table spaces and partition tables at source and target
+
+For Example:
+* **Main table:** transactions
+* **Table spaces:** eu_ts, ap_ts and us_ts
+* **Partition Tables:** transactions_eu, transactions_in and transactions_us
+
+```sql
+CREATE TABLE transactions (
+    user_id   INTEGER NOT NULL,
+    account_id INTEGER NOT NULL,
+    geo_partition VARCHAR,
+    amount NUMERIC NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+) PARTITION BY LIST (geo_partition);
+
+CREATE TABLESPACE eu_ts WITH(
+    replica_placement='{"num_replicas": 1, "placement_blocks":
+    [{"cloud": "aws", "region": "eu-west-3","zone":"eu-west-3a", "min_num_replicas":1}]}');
+
+CREATE TABLESPACE us_ts WITH(
+    replica_placement='{"num_replicas": 1, "placement_blocks":
+    [{"cloud": "aws", "region": "us-west-2","zone":"us-west-2a", "min_num_replicas":1}]}');
+
+CREATE TABLESPACE ap_ts WITH(
+    replica_placement='{"num_replicas": 1, "placement_blocks":
+    [{"cloud": "aws", "region": "ap-south-1","zone":"ap-south-1a", "min_num_replicas":1}]}');
+
+
+CREATE TABLE transactions_eu
+                  PARTITION OF transactions
+                  (user_id, account_id, geo_partition, amount, created_at,
+                  PRIMARY KEY (user_id HASH, account_id, geo_partition))
+                  FOR VALUES IN ('EU') TABLESPACE eu_ts;
+
+CREATE TABLE transactions_in
+                  PARTITION OF transactions
+                  (user_id, account_id, geo_partition, amount, created_at,
+                  PRIMARY KEY (user_id HASH, account_id, geo_partition))
+                  FOR VALUES IN ('IN') TABLESPACE ap_ts;
+
+CREATE TABLE transactions_us
+                  PARTITION OF transactions
+                  (user_id, account_id, geo_partition, amount, created_at,
+                  PRIMARY KEY (user_id HASH, account_id, geo_partition))
+                  DEFAULT TABLESPACE us_ts;
+```
+### Steps to create Replication(Unidirectional):
+1. Collect child table UUIDs from source universe (partition tables, here transactions_eu, transactions_in and transactions_us) - these will be used while setting up replication. To collect tables' UUID, Goto `AdminUI -> Tables` option
+
+  ![xCluster_with_GP](docs/static/images/explore/yb_example_table_UUID.png)
+
+2. Run replication setup command at source universe 
+    ```.sh
+    ./bin/yb-admin -master_addresses <consumer_master_addresses> \
+    setup_universe_replication <producer universe UUID>_<stream_name> \
+    <producer_master_addresses> <comma_separated_table_ids>
+    ```
+
+    For Example:
+    ```.sh
+    ./bin/yb-admin -master_addresses 127.0.0.11:7100,127.0.0.12:7100,127.0.0.13:7100 \
+    setup_universe_replication e260b8b6-e89f-4505-bb8e-b31f74aa29f3_xClusterSetup1 \
+    127.0.0.1:7100,127.0.0.2:7100,127.0.0.3:7100 \
+    000030a5000030008000000000004000,000030a5000030008000000000004005,dfef757c415c4b2cacc9315b8acb539a
+    ```
+3. Observe replication setup(`xClusterSetup1`) in Platform UI(At Replication tab in source universe and target universe)
+4. Do some DMLs(insert/update/delete) to parent table of source and observe the replication at target side(in parent table and partition tables).
+
+You can verify replication by stopping the workload and then using the `COUNT(*)` function on both source and target universes.
 ### Unidirectional Replication
 
 For unidirectional replication, connect to the yugabyte-target universe using the YSQL shell (`ysqlsh`) or the YCQL shell (`ycqlsh`), and confirm that you can see the expected records.
