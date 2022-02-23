@@ -143,7 +143,7 @@ When both universes use different certificates, you need to store the certificat
       127.0.0.1:7100,127.0.0.2:7100,127.0.0.3:7100 \
       000030a5000030008000000000004000,000030a5000030008000000000004005,dfef757c415c4b2cacc9315b8acb539a
     ```
-You can verify replication by stopping the workload and then using the `COUNT(*)` function on the yugabyte-target to yugabyte-source match.
+
 ## Setting up Replication with Geo-partitioning
 
 Create 2 universes(source and target) with same configurations(with same regions and zones) as below
@@ -230,7 +230,8 @@ CREATE TABLE transactions_us
 3. Observe replication setup(`xClusterSetup1`) in Platform UI(At Replication tab in source universe and target universe)
 4. Do some DMLs(insert/update/delete) to parent table of source and observe the replication at target side(in parent table and partition tables).
 
-You can verify replication by stopping the workload and then using the `COUNT(*)` function on both source and target universes.
+## Verifying Replication
+You can verify replication by stopping the workload and then using the `COUNT(*)` function on the yugabyte-target to yugabyte-source match.
 ### Unidirectional Replication
 
 For unidirectional replication, connect to the yugabyte-target universe using the YSQL shell (`ysqlsh`) or the YCQL shell (`ycqlsh`), and confirm that you can see the expected records.
