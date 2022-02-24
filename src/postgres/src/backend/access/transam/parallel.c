@@ -137,6 +137,9 @@ static const struct
 	},
 	{
 		"_bt_parallel_build_main", _bt_parallel_build_main
+	},
+	{
+		"ParallelCopyMain", 
 	}
 };
 

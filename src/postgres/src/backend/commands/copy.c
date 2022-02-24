@@ -121,6 +121,7 @@ typedef struct CopyStateData
 	char	   *filename;		/* filename, or NULL for STDIN/STDOUT */
 	bool		is_program;		/* is 'filename' a program to popen? */
 	int			batch_size;		/* copy from executes in batch sizes */
+	int			num_workers;    /* number of parallel workers */
 	copy_data_source_cb data_source_cb; /* function for reading data */
 	bool		binary;			/* binary format? */
 	bool		oids;			/* include OIDs? */
@@ -311,6 +312,8 @@ static uint64 DoCopyTo(CopyState cstate);
 static uint64 CopyTo(CopyState cstate);
 static void CopyOneRowTo(CopyState cstate, Oid tupleOid,
 			 Datum *values, bool *nulls);
+static void CopyFromMain(CopyState cstate);
+static uint64 CopyFromWorker(CopyState cstate);
 static void CopyFromInsertBatch(CopyState cstate, EState *estate,
 					CommandId mycid, int hi_options,
 					ResultRelInfo *resultRelInfo, TupleTableSlot *myslot,
@@ -1003,7 +1006,80 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 
 		cstate = BeginCopyFrom(pstate, rel, stmt->filename, stmt->is_program,
 							   NULL, stmt->attlist, stmt->options);
-		*processed = CopyFrom(cstate);	/* copy from file to database */
+		if (cstate->num_workers > 0)
+		{
+			ParallelContext *pcxt;
+			Form_pg_class relform_space;
+			CopyState cstate_space;
+			Relation rel_space;
+
+			/* Perform CopyFromMain so we can fail fast. */
+			CopyFromMain(cstate);
+
+			EnterParallelMode();
+
+			/* Create a parallel context. */
+			/* I think we'll have to create a parallel context for every single worker? Otherwise they'll all share the same segment */
+			pcxt = CreateParallelContext("postgres", "ParallelCopyMain", 1, false);
+
+			/* Estimate space for Form_pg_class, needed for Relation. */
+			shm_toc_estimate_chunk(&pcxt->estimator, CLASS_TUPLE_SIZE);
+			shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+			/* Estimate space for Relation, needed for CopyState */
+			shm_toc_estimate_chunk(&pcxt->estimator, sizeof(RelationData));
+			shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+			/* Estimate space for CopyState. */
+			shm_toc_estimate_chunk(&pcxt->estimator, sizeof(CopyStateData));
+			shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+			/* Everyone's had a chance to ask for space, so now create the DSM. */
+			InitializeParallelDSM(pcxt);
+
+			/* Store Form_pg_class. */
+			relform_space = (FormData_pg_class *) 
+					shm_toc_allocate(pcxt->toc, CLASS_TUPLE_SIZE);
+			memcpy(relform_space, cstate->rel->rd_rel, CLASS_TUPLE_SIZE);
+			shm_toc_insert(pcxt->toc, 0, relform_space);
+
+			/* Store Relation. */
+			rel_space = (RelationData *)
+				shm_toc_allocate(pcxt->toc, sizeof(RelationData));
+			rel_space->rd_rel = relform_space;
+			/* rel->rd_att initialized in worker. */
+			rel_space->rd_id = cstate->rel->rd_id;
+			rel_space->rd_refcnt = cstate->rel->rd_refcnt;
+			rel_space->rd_isnailed = cstate->rel->rd_isnailed;
+			rel_space->rd_createSubid = cstate->rel->rd_createSubid;
+			rel_space->rd_newRelfilenodeSubid = cstate->rel->rd_newRelfilenodeSubid;
+			rel_space->rd_indexvalid = cstate->rel->rd_indexvalid;
+			rel_space->rd_isvalid = cstate->rel->rd_isvalid;
+			rel_space->rd_oidindex = cstate->rel->rd_oidindex;
+			rel_space->rd_pkindex = cstate->rel->rd_pkindex;
+			rel_space->rd_replidindex = cstate->rel->rd_replidindex;
+			shm_toc_insert(pcxt->toc, 1, rel_space);
+
+			/* Store CopyState, needed for CopyFromWorker. */
+			cstate_space = (CopyStateData *)
+					shm_toc_allocate(pcxt->toc, sizeof(CopyStateData));
+			/* cstate->attnumList = ? */
+			/* cstate->transition_capture_state = ? */
+			/* cstate->range_table = ? */
+			cstate_space->batch_size = cstate->batch_size;
+			cstate_space->freeze = cstate->freeze;
+			cstate_space->cur_relname = cstate->cur_relname;
+			cstate_space->cur_lineno = cstate->cur_lineno;
+			cstate_space->cur_attname = cstate->cur_attname;
+			cstate_space->cur_attval = cstate->cur_attval;
+			shm_toc_insert(pcxt->toc, 2, cstate_space);
+
+			LaunchParallelWorkers(pcxt);
+
+			ExitParallelMode();
+		}
+		else
+			*processed = CopyFrom(cstate);	/* copy from file to database */
 		EndCopyFrom(cstate);
 	}
 	else
@@ -1059,6 +1135,8 @@ ProcessCopyOptions(ParseState *pstate,
 	cstate->file_encoding = -1;
 
 	cstate->batch_size = -1;
+
+	cstate->num_workers = 0;
 
 	/* Extract options from the statement node tree */
 	foreach(option, options)
@@ -1119,6 +1197,17 @@ ProcessCopyOptions(ParseState *pstate,
 			int rows = defGetInt32(defel);
 			if (rows >= 0)
 				cstate->batch_size = rows;
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("argument to option \"%s\" must be a positive integer", defel->defname),
+						 parser_errposition(pstate, defel->location)));
+		}
+		else if (strcmp(defel->defname, "num_workers") == 0)
+		{
+			int num_workers = defGetInt32(defel);
+			if (num_workers >= 0)
+				cstate->num_workers = num_workers;
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -3142,6 +3231,816 @@ CopyFrom(CopyState cstate)
 		heap_sync(cstate->rel);
 
 	return processed;
+}
+
+/*
+ * Copy FROM logic handled by main process when using parallel copy.
+ */
+static void CopyFromMain(CopyState cstate)
+{
+	ResultRelInfo *resultRelInfo;
+
+	/*
+	 * If the batch size is not explicitly set in the query by the user,
+	 * use the session variable value.
+	 */
+	if (cstate->batch_size < 0)
+	{
+		cstate->batch_size = yb_default_copy_from_rows_per_transaction;
+	}
+
+	/*
+	 * The target must be a plain, foreign, or partitioned relation, or have
+	 * an INSTEAD OF INSERT row trigger.  (Currently, such triggers are only
+	 * allowed on views, so we only hint about them in the view case.)
+	 */
+	if (cstate->rel->rd_rel->relkind != RELKIND_RELATION &&
+		cstate->rel->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&
+		cstate->rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE &&
+		!(cstate->rel->trigdesc &&
+		  cstate->rel->trigdesc->trig_insert_instead_row))
+	{
+		if (cstate->rel->rd_rel->relkind == RELKIND_VIEW)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot copy to view \"%s\"",
+							RelationGetRelationName(cstate->rel)),
+					 errhint("To enable copying to a view, provide an INSTEAD OF INSERT trigger.")));
+		else if (cstate->rel->rd_rel->relkind == RELKIND_MATVIEW)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot copy to materialized view \"%s\"",
+							RelationGetRelationName(cstate->rel))));
+		else if (cstate->rel->rd_rel->relkind == RELKIND_SEQUENCE)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot copy to sequence \"%s\"",
+							RelationGetRelationName(cstate->rel))));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot copy to non-table relation \"%s\"",
+							RelationGetRelationName(cstate->rel))));
+	}
+
+	resultRelInfo = makeNode(ResultRelInfo);
+	InitResultRelInfo(resultRelInfo,
+					  cstate->rel,
+					  1,		/* dummy rangetable index */
+					  NULL,
+					  0);
+
+	/* Verify the named relation is a valid target for INSERT */
+	CheckValidResultRel(resultRelInfo, CMD_INSERT);
+}
+
+/*
+ * Copy FROM logic handled by background workers when using parallel copy.
+ */
+static uint64 
+CopyFromWorker(CopyState cstate)
+{
+HeapTuple	tuple;
+	TupleDesc	tupDesc;
+	Datum	   *values;
+	bool	   *nulls;
+	ResultRelInfo *resultRelInfo;
+	ResultRelInfo *saved_resultRelInfo = NULL;
+	EState	   *estate = CreateExecutorState(); /* for ExecConstraints() */
+	ModifyTableState *mtstate;
+	ExprContext *econtext;
+	TupleTableSlot *myslot;
+	MemoryContext oldcontext = GetCurrentMemoryContext();
+
+	ErrorContextCallback errcallback;
+	CommandId	mycid = GetCurrentCommandId(true);
+	int			hi_options = 0; /* start with default heap_insert options */
+	BulkInsertState bistate;
+	uint64		processed = 0;
+	bool		useMultiInsert;
+	bool		useYBMultiInsert;
+	bool		useHeapMultiInsert;
+	int			nBufferedTuples = 0;
+	int			prev_leaf_part_index = -1;
+	bool		useNonTxnInsert;
+	bool		isBatchTxnCopy;
+
+	isBatchTxnCopy = cstate->batch_size > 0;
+
+#define MAX_BUFFERED_TUPLES 1000
+	HeapTuple  *bufferedTuples = NULL;	/* initialize to silence warning */
+	Size		bufferedTuplesSize = 0;
+	uint64		firstBufferedLineNo = 0;
+
+	Assert(cstate->rel);
+
+	tupDesc = RelationGetDescr(cstate->rel);
+
+	/*----------
+	 * Check to see if we can avoid writing WAL
+	 *
+	 * If archive logging/streaming is not enabled *and* either
+	 *	- table was created in same transaction as this COPY
+	 *	- data is being written to relfilenode created in this transaction
+	 * then we can skip writing WAL.  It's safe because if the transaction
+	 * doesn't commit, we'll discard the table (or the new relfilenode file).
+	 * If it does commit, we'll have done the heap_sync at the bottom of this
+	 * routine first.
+	 *
+	 * As mentioned in comments in utils/rel.h, the in-same-transaction test
+	 * is not always set correctly, since in rare cases rd_newRelfilenodeSubid
+	 * can be cleared before the end of the transaction. The exact case is
+	 * when a relation sets a new relfilenode twice in same transaction, yet
+	 * the second one fails in an aborted subtransaction, e.g.
+	 *
+	 * BEGIN;
+	 * TRUNCATE t;
+	 * SAVEPOINT save;
+	 * TRUNCATE t;
+	 * ROLLBACK TO save;
+	 * COPY ...
+	 *
+	 * Also, if the target file is new-in-transaction, we assume that checking
+	 * FSM for free space is a waste of time, even if we must use WAL because
+	 * of archiving.  This could possibly be wrong, but it's unlikely.
+	 *
+	 * The comments for heap_insert and RelationGetBufferForTuple specify that
+	 * skipping WAL logging is only safe if we ensure that our tuples do not
+	 * go into pages containing tuples from any other transactions --- but this
+	 * must be the case if we have a new table or new relfilenode, so we need
+	 * no additional work to enforce that.
+	 *
+	 * We currently don't support this optimization if the COPY target is a
+	 * partitioned table as we currently only lazily initialize partition
+	 * information when routing the first tuple to the partition.  We cannot
+	 * know at this stage if we can perform this optimization.  It should be
+	 * possible to improve on this, but it does mean maintaining heap insert
+	 * option flags per partition and setting them when we first open the
+	 * partition.
+	 *
+	 * This optimization is not supported for relation types which do not
+	 * have any physical storage, with foreign tables and views using
+	 * INSTEAD OF triggers entering in this category.  Partitioned tables
+	 * are not supported as per the description above.
+	 *----------
+	 */
+	/* createSubid is creation check, newRelfilenodeSubid is truncation check */
+	if (cstate->rel->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&
+		cstate->rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE &&
+		cstate->rel->rd_rel->relkind != RELKIND_VIEW &&
+		(cstate->rel->rd_createSubid != InvalidSubTransactionId ||
+		 cstate->rel->rd_newRelfilenodeSubid != InvalidSubTransactionId))
+	{
+		hi_options |= HEAP_INSERT_SKIP_FSM;
+		if (!XLogIsNeeded())
+			hi_options |= HEAP_INSERT_SKIP_WAL;
+	}
+
+	/*
+	 * Optimize if new relfilenode was created in this subxact or one of its
+	 * committed children and we won't see those rows later as part of an
+	 * earlier scan or command. The subxact test ensures that if this subxact
+	 * aborts then the frozen rows won't be visible after xact cleanup.  Note
+	 * that the stronger test of exactly which subtransaction created it is
+	 * crucial for correctness of this optimization. The test for an earlier
+	 * scan or command tolerates false negatives. FREEZE causes other sessions
+	 * to see rows they would not see under MVCC, and a false negative merely
+	 * spreads that anomaly to the current session.
+	 */
+	if (cstate->freeze)
+	{
+		/*
+		 * We currently disallow COPY FREEZE on partitioned tables.  The
+		 * reason for this is that we've simply not yet opened the partitions
+		 * to determine if the optimization can be applied to them.  We could
+		 * go and open them all here, but doing so may be quite a costly
+		 * overhead for small copies.  In any case, we may just end up routing
+		 * tuples to a small number of partitions.  It seems better just to
+		 * raise an ERROR for partitioned tables.
+		 */
+		if (cstate->rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		{
+			ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cannot perform FREEZE on a partitioned table")));
+		}
+
+		/*
+		 * Tolerate one registration for the benefit of FirstXactSnapshot.
+		 * Scan-bearing queries generally create at least two registrations,
+		 * though relying on that is fragile, as is ignoring ActiveSnapshot.
+		 * Clear CatalogSnapshot to avoid counting its registration.  We'll
+		 * still detect ongoing catalog scans, each of which separately
+		 * registers the snapshot it uses.
+		 */
+		InvalidateCatalogSnapshot();
+		if (!ThereAreNoPriorRegisteredSnapshots() || !ThereAreNoReadyPortals())
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+					 errmsg("cannot perform FREEZE because of prior transaction activity")));
+
+		if (cstate->rel->rd_createSubid != GetCurrentSubTransactionId() &&
+			cstate->rel->rd_newRelfilenodeSubid != GetCurrentSubTransactionId())
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot perform FREEZE because the table was not created or truncated in the current subtransaction")));
+
+		hi_options |= HEAP_INSERT_FROZEN;
+	}
+
+	/*
+	 * We need a ResultRelInfo so we can use the regular executor's
+	 * index-entry-making machinery.  (There used to be a huge amount of code
+	 * here that basically duplicated execUtils.c ...)
+	 */
+	resultRelInfo = makeNode(ResultRelInfo);
+	InitResultRelInfo(resultRelInfo,
+					  cstate->rel,
+					  1,		/* dummy rangetable index */
+					  NULL,
+					  0);
+
+	ExecOpenIndices(resultRelInfo, false);
+
+	estate->es_result_relations = resultRelInfo;
+	estate->es_num_result_relations = 1;
+	estate->es_result_relation_info = resultRelInfo;
+	estate->es_range_table = cstate->range_table;
+
+	/* Set up a tuple slot too */
+	myslot = ExecInitExtraTupleSlot(estate, tupDesc);
+	/* Triggers might need a slot as well */
+	estate->es_trig_tuple_slot = ExecInitExtraTupleSlot(estate, NULL);
+
+	/*
+	 * Set up a ModifyTableState so we can let FDW(s) init themselves for
+	 * foreign-table result relation(s).
+	 */
+	mtstate = makeNode(ModifyTableState);
+	mtstate->ps.plan = NULL;
+	mtstate->ps.state = estate;
+	mtstate->operation = CMD_INSERT;
+	mtstate->resultRelInfo = estate->es_result_relations;
+
+	if (resultRelInfo->ri_FdwRoutine != NULL &&
+		resultRelInfo->ri_FdwRoutine->BeginForeignInsert != NULL)
+		resultRelInfo->ri_FdwRoutine->BeginForeignInsert(mtstate,
+														 resultRelInfo);
+
+	/* Prepare to catch AFTER triggers. */
+	AfterTriggerBeginQuery();
+
+	/*
+	 * If there are any triggers with transition tables on the named relation,
+	 * we need to be prepared to capture transition tuples.
+	 */
+	cstate->transition_capture =
+		MakeTransitionCaptureState(cstate->rel->trigdesc,
+								   RelationGetRelid(cstate->rel),
+								   CMD_INSERT);
+
+	/*
+	 * If the named relation is a partitioned table, initialize state for
+	 * CopyFrom tuple routing.
+	 */
+	if (cstate->rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		PartitionTupleRouting *proute;
+
+		proute = cstate->partition_tuple_routing =
+			ExecSetupPartitionTupleRouting(NULL, cstate->rel);
+
+		/*
+		 * If we are capturing transition tuples, they may need to be
+		 * converted from partition format back to partitioned table format
+		 * (this is only ever necessary if a BEFORE trigger modifies the
+		 * tuple).
+		 */
+		if (cstate->transition_capture != NULL)
+			ExecSetupChildParentMapForLeaf(proute);
+	}
+
+	if (isBatchTxnCopy)
+	{
+		/*
+		 * Batched copy is not supported
+		 * under the following use cases in which case
+		 * all rows will be copied over in a single transaction.
+		 */
+		int batch_size = 0;
+
+		if (!IsYBRelation(resultRelInfo->ri_RelationDesc))
+			ereport(WARNING,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 	 errmsg("Batched COPY is not supported on temporary tables. "
+						"Defaulting to using one transaction for the entire copy."),
+				 errhint("Either copy onto non-temporary table or set rows_per_transaction "
+						 "option to `0` to disable batching and remove this warning.")));
+		else if (YBIsDataSent())
+			ereport(WARNING,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Batched COPY is not supported in transaction blocks. "
+						"Defaulting to using one transaction for the entire copy."),
+				 errhint("Either run this COPY outside of a transaction block or set "
+						 "rows_per_transaction option to `0` to disable batching and "
+						 "remove this warning.")));
+
+		else
+		{
+			batch_size = cstate->batch_size;
+		}
+		cstate->batch_size = batch_size;
+	}
+
+	/*
+	 * It's more efficient to prepare a bunch of tuples for insertion, and
+	 * insert them in one heap_multi_insert() call, than call heap_insert()
+	 * separately for every tuple. However, we can't do that if there are
+	 * BEFORE/INSTEAD OF triggers, or we need to evaluate volatile default
+	 * expressions. Such triggers or expressions might query the table we're
+	 * inserting to, and act differently if the tuples that have already been
+	 * processed and prepared for insertion are not there.  We also can't do
+	 * it if the table is foreign or partitioned.
+	 */
+	if ((resultRelInfo->ri_TrigDesc != NULL &&
+		 (resultRelInfo->ri_TrigDesc->trig_insert_before_row ||
+		  resultRelInfo->ri_TrigDesc->trig_insert_instead_row)) ||
+		resultRelInfo->ri_FdwRoutine != NULL ||
+		cstate->partition_tuple_routing != NULL ||
+		cstate->volatile_defexprs)
+	{
+		useMultiInsert = false;
+	}
+	else
+	{
+		useMultiInsert = true;
+	}
+
+	useYBMultiInsert = useMultiInsert && IsYBRelation(resultRelInfo->ri_RelationDesc);
+	useHeapMultiInsert = useMultiInsert && !IsYBRelation(resultRelInfo->ri_RelationDesc);
+	if (useHeapMultiInsert)
+	{
+		bufferedTuples = palloc(MAX_BUFFERED_TUPLES * sizeof(HeapTuple));
+	}
+
+	/*
+	 * Only use non-txn insert if it's explicitly enabled, the relation meets criteria for
+	 * multi insert (e.g. no triggers), and the relation does not have secondary indices.
+	 */
+	if (YBIsNonTxnCopyEnabled() &&
+		useYBMultiInsert &&
+		!YBCRelInfoHasSecondaryIndices(resultRelInfo))
+	{
+		useNonTxnInsert = true;
+	}
+	else
+	{
+		useNonTxnInsert = false;
+	}
+
+	/*
+	 * Check BEFORE STATEMENT insertion triggers. It's debatable whether we
+	 * should do this for COPY, since it's not really an "INSERT" statement as
+	 * such. However, executing these triggers maintains consistency with the
+	 * EACH ROW triggers that we already fire on COPY.
+	 */
+	ExecBSInsertTriggers(estate, resultRelInfo);
+
+	values = (Datum *) palloc(tupDesc->natts * sizeof(Datum));
+	nulls = (bool *) palloc(tupDesc->natts * sizeof(bool));
+
+	bistate = GetBulkInsertState();
+	econtext = GetPerTupleExprContext(estate);
+
+	/* Set up callback to identify error line number */
+	errcallback.callback = CopyFromErrorCallback;
+	errcallback.arg = (void *) cstate;
+	errcallback.previous = error_context_stack;
+	error_context_stack = &errcallback;
+
+	/* Warn if non-txn COPY enabled and relation does not meet non-txn criteria. */
+	if (YBIsNonTxnCopyEnabled() && !useNonTxnInsert)
+		ereport(WARNING,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("non-transactional COPY is not supported on this relation; "
+						"using transactional COPY instead"),
+				 errhint("Non-transactional COPY is not supported on relations with "
+						 "secondary indices or triggers.")));
+
+	bool has_more_tuples = true;
+	while (has_more_tuples)
+	{
+		/*
+		 * When batch size is not provided from the query option,
+		 * default behavior is to read each line from the file
+		 * until no more lines are left. If batch size is provided,
+		 * lines will be read in batch sizes at a time.
+		 */
+		for (int i = 0; cstate->batch_size == 0 || i < cstate->batch_size; i++)
+		{
+			if (IsYBRelation(resultRelInfo->ri_RelationDesc))
+				MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+
+			TupleTableSlot *slot;
+			bool		skip_tuple;
+			Oid			loaded_oid = InvalidOid;
+
+			CHECK_FOR_INTERRUPTS();
+
+			if (!IsYBRelation(resultRelInfo->ri_RelationDesc) && nBufferedTuples == 0)
+			{
+				/*
+				 * Reset the per-tuple exprcontext. We can only do this if the
+				 * tuple buffer is empty. (Calling the context the per-tuple
+				 * memory context is a bit of a misnomer now.)
+				 */
+				ResetPerTupleExprContext(estate);
+			}
+
+			/* Switch into its memory context */
+			if (!IsYBRelation(resultRelInfo->ri_RelationDesc))
+				MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+
+			has_more_tuples = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
+			if (!has_more_tuples)
+				break;
+
+			/* And now we can form the input tuple. */
+			tuple = heap_form_tuple(tupDesc, values, nulls);
+
+			if (loaded_oid != InvalidOid)
+				HeapTupleSetOid(tuple, loaded_oid);
+
+			/*
+			 * Constraints might reference the tableoid column, so initialize
+			 * t_tableOid before evaluating them.
+			 */
+			tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+
+			/* Triggers and stuff need to be invoked in query context. */
+			if (!IsYBRelation(resultRelInfo->ri_RelationDesc))
+				MemoryContextSwitchTo(oldcontext);
+
+			/* Place tuple in tuple slot --- but slot shouldn't free it */
+			slot = myslot;
+			ExecStoreHeapTuple(tuple, slot, false);
+
+			/* Determine the partition to heap_insert the tuple into */
+			if (cstate->partition_tuple_routing)
+			{
+				int			leaf_part_index;
+				TupleConversionMap *map;
+				PartitionTupleRouting *proute = cstate->partition_tuple_routing;
+
+				/*
+				 * Away we go ... If we end up not finding a partition after all,
+				 * ExecFindPartition() does not return and errors out instead.
+				 * Otherwise, the returned value is to be used as an index into
+				 * arrays mt_partitions[] and mt_partition_tupconv_maps[] that
+				 * will get us the ResultRelInfo and TupleConversionMap for the
+				 * partition, respectively.
+				 */
+				leaf_part_index = ExecFindPartition(resultRelInfo,
+													proute->partition_dispatch_info,
+													slot,
+													estate);
+				Assert(leaf_part_index >= 0 &&
+					   leaf_part_index < proute->num_partitions);
+
+				/*
+				 * If this tuple is mapped to a partition that is not same as the
+				 * previous one, we'd better make the bulk insert mechanism gets a
+				 * new buffer.
+				 */
+				if (prev_leaf_part_index != leaf_part_index)
+				{
+					ReleaseBulkInsertStatePin(bistate);
+					prev_leaf_part_index = leaf_part_index;
+				}
+
+				/*
+				 * Save the old ResultRelInfo and switch to the one corresponding
+				 * to the selected partition.
+				 */
+				saved_resultRelInfo = resultRelInfo;
+				resultRelInfo = proute->partitions[leaf_part_index];
+				if (resultRelInfo == NULL)
+				{
+					resultRelInfo = ExecInitPartitionInfo(mtstate,
+														  saved_resultRelInfo,
+														  proute, estate,
+														  leaf_part_index);
+					Assert(resultRelInfo != NULL);
+				}
+
+				/*
+				 * For ExecInsertIndexTuples() to work on the partition's indexes
+				 */
+				estate->es_result_relation_info = resultRelInfo;
+
+				/*
+				 * If we're capturing transition tuples, we might need to convert
+				 * from the partition rowtype to parent rowtype.
+				 */
+				if (cstate->transition_capture != NULL)
+				{
+					if (resultRelInfo->ri_TrigDesc &&
+						resultRelInfo->ri_TrigDesc->trig_insert_before_row)
+					{
+						/*
+						 * If there are any BEFORE triggers on the partition,
+						 * we'll have to be ready to convert their result back to
+						 * tuplestore format.
+						 */
+						cstate->transition_capture->tcs_original_insert_tuple = NULL;
+						cstate->transition_capture->tcs_map =
+							TupConvMapForLeaf(proute, saved_resultRelInfo,
+											  leaf_part_index);
+					}
+					else
+					{
+						/*
+						 * Otherwise, just remember the original unconverted
+						 * tuple, to avoid a needless round trip conversion.
+						 */
+						cstate->transition_capture->tcs_original_insert_tuple = tuple;
+						cstate->transition_capture->tcs_map = NULL;
+					}
+				}
+
+				/*
+				 * We might need to convert from the parent rowtype to the
+				 * partition rowtype.
+				 */
+				map = proute->parent_child_tupconv_maps[leaf_part_index];
+				if (map != NULL)
+				{
+					TupleTableSlot *new_slot;
+					MemoryContext oldcontext;
+
+					Assert(proute->partition_tuple_slots != NULL &&
+					proute->partition_tuple_slots[leaf_part_index] != NULL);
+					new_slot = proute->partition_tuple_slots[leaf_part_index];
+					slot = execute_attr_map_slot(map->attrMap, slot, new_slot);
+
+					/*
+					 * Get the tuple in the per-tuple context, so that it will be
+					 * freed after each batch insert.
+					*/
+					oldcontext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+					tuple = ExecCopySlotTuple(slot);
+					MemoryContextSwitchTo(oldcontext);
+				}
+				/*
+				 * Tuple memory will be allocated to per row memory context
+				 * which will be cleaned up after every row gets processed.
+				 * Thus there is no need to clean the tuple memory.
+				 */
+				if (IsYBRelation(resultRelInfo->ri_RelationDesc))
+					slot->tts_shouldFree = false;
+
+				tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+			}
+
+			skip_tuple = false;
+
+			/* BEFORE ROW INSERT Triggers */
+			if (resultRelInfo->ri_TrigDesc &&
+				resultRelInfo->ri_TrigDesc->trig_insert_before_row)
+			{
+				slot = ExecBRInsertTriggers(estate, resultRelInfo, slot);
+
+				if (slot == NULL)	/* "do nothing" */
+					skip_tuple = true;
+				else				/* trigger might have changed tuple */
+					tuple = ExecMaterializeSlot(slot);
+			}
+
+			if (!skip_tuple)
+			{
+				if (resultRelInfo->ri_TrigDesc &&
+					resultRelInfo->ri_TrigDesc->trig_insert_instead_row)
+				{
+					/* Pass the data to the INSTEAD ROW INSERT trigger */
+					ExecIRInsertTriggers(estate, resultRelInfo, slot);
+				}
+				else
+				{
+					/*
+					 * If the target is a plain table, check the constraints of
+					 * the tuple.
+					 */
+					if (resultRelInfo->ri_FdwRoutine == NULL &&
+						resultRelInfo->ri_RelationDesc->rd_att->constr)
+						ExecConstraints(resultRelInfo, slot, estate, mtstate);
+
+					/*
+					 * Also check the tuple against the partition constraint, if
+					 * there is one; except that if we got here via tuple-routing,
+					 * we don't need to if there's no BR trigger defined on the
+					 * partition.
+					 */
+					if (resultRelInfo->ri_PartitionCheck &&
+						(saved_resultRelInfo == NULL ||
+						 (resultRelInfo->ri_TrigDesc &&
+						  resultRelInfo->ri_TrigDesc->trig_insert_before_row)))
+						ExecPartitionCheck(resultRelInfo, slot, estate, true);
+
+					if (useHeapMultiInsert)
+					{
+						/* Add this tuple to the tuple buffer */
+						if (nBufferedTuples == 0)
+							firstBufferedLineNo = cstate->cur_lineno;
+						bufferedTuples[nBufferedTuples++] = tuple;
+						bufferedTuplesSize += tuple->t_len;
+
+						/*
+						 * If the buffer filled up, flush it.  Also flush if the
+						 * total size of all the tuples in the buffer becomes
+						 * large, to avoid using large amounts of memory for the
+						 * buffer when the tuples are exceptionally wide.
+						 */
+						if (nBufferedTuples == MAX_BUFFERED_TUPLES ||
+							bufferedTuplesSize > 65535)
+						{
+							CopyFromInsertBatch(cstate, estate, mycid, hi_options,
+												resultRelInfo, myslot, bistate,
+												nBufferedTuples, bufferedTuples,
+												firstBufferedLineNo);
+							nBufferedTuples = 0;
+							bufferedTuplesSize = 0;
+						}
+					}
+					else
+					{
+						List	   *recheckIndexes = NIL;
+
+						/* OK, store the tuple and create index entries for it */
+						if (IsYBRelation(resultRelInfo->ri_RelationDesc))
+						{
+							if (useNonTxnInsert)
+							{
+								YBCExecuteNonTxnInsert(resultRelInfo->ri_RelationDesc, tupDesc, tuple);
+							}
+							else
+							{
+								YBCExecuteInsert(resultRelInfo->ri_RelationDesc, tupDesc, tuple);
+							}
+						}
+						else if (resultRelInfo->ri_FdwRoutine != NULL)
+						{
+							MemoryContext saved_context;
+							saved_context = MemoryContextSwitchTo(estate->es_query_cxt);
+							slot = resultRelInfo->ri_FdwRoutine->ExecForeignInsert(estate,
+																				   resultRelInfo,
+																				   slot,
+																				   NULL);
+							MemoryContextSwitchTo(saved_context);
+							if (slot == NULL)	/* "do nothing" */
+								goto next_tuple;
+
+							/* FDW might have changed tuple */
+							tuple = ExecMaterializeSlot(slot);
+
+							/*
+							 * AFTER ROW Triggers might reference the tableoid
+							 * column, so initialize t_tableOid before evaluating
+							 * them.
+							 */
+							tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+						}
+						else
+							heap_insert(resultRelInfo->ri_RelationDesc, tuple,
+										mycid, hi_options, bistate);
+
+						/* And create index entries for it */
+						if (resultRelInfo->ri_NumIndices > 0)
+							recheckIndexes = ExecInsertIndexTuples(slot,
+																   tuple,
+																   estate,
+																   false,
+																   NULL,
+																   NIL);
+
+						/* AFTER ROW INSERT Triggers */
+						ExecARInsertTriggers(estate, resultRelInfo, tuple,
+											 recheckIndexes, cstate->transition_capture);
+
+						list_free(recheckIndexes);
+					}
+				}
+
+				/*
+				 * We count only tuples not suppressed by a BEFORE INSERT trigger
+				 * or FDW; this is the same definition used by nodeModifyTable.c
+				 * for counting tuples inserted by an INSERT command.
+				 */
+				processed++;
+			}
+
+		next_tuple:
+			/* Restore the saved ResultRelInfo */
+			if (saved_resultRelInfo)
+			{
+				resultRelInfo = saved_resultRelInfo;
+				estate->es_result_relation_info = resultRelInfo;
+			}
+
+			/*
+			 * Free context per row.
+			 */
+			if (IsYBRelation(cstate->rel))
+				ResetPerTupleExprContext(estate);
+		}
+		/*
+		 * Commit transaction per batch.
+		 * When CopyFrom method is called, we are already inside a transaction block
+		 * and relevant transaction state properties have been previously set.
+		 */
+		if (isBatchTxnCopy)
+		{
+			YBCCommitTransaction();
+			YBInitializeTransaction();
+		}
+	}
+
+	/* Flush any remaining buffered tuples */
+	if (nBufferedTuples > 0)
+		CopyFromInsertBatch(cstate, estate, mycid, hi_options,
+							resultRelInfo, myslot, bistate,
+							nBufferedTuples, bufferedTuples,
+							firstBufferedLineNo);
+
+	/* Done, clean up */
+	error_context_stack = errcallback.previous;
+
+	FreeBulkInsertState(bistate);
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/*
+	 * In the old protocol, tell pqcomm that we can process normal protocol
+	 * messages again.
+	 */
+	if (cstate->copy_dest == COPY_OLD_FE)
+		pq_endmsgread();
+
+	/* Execute AFTER STATEMENT insertion triggers */
+	ExecASInsertTriggers(estate, resultRelInfo, cstate->transition_capture);
+
+	/* Handle queued AFTER triggers */
+	AfterTriggerEndQuery(estate);
+
+	pfree(values);
+	pfree(nulls);
+
+	ExecResetTupleTable(estate->es_tupleTable, false);
+
+	/* Allow the FDW to shut down */
+	if (resultRelInfo->ri_FdwRoutine != NULL &&
+		resultRelInfo->ri_FdwRoutine->EndForeignInsert != NULL)
+		resultRelInfo->ri_FdwRoutine->EndForeignInsert(estate,
+													   resultRelInfo);
+
+	ExecCloseIndices(resultRelInfo);
+
+	/* Close all the partitioned tables, leaf partitions, and their indices */
+	if (cstate->partition_tuple_routing)
+		ExecCleanupTupleRouting(mtstate, cstate->partition_tuple_routing);
+
+	/* Close any trigger target relations */
+	ExecCleanUpTriggerState(estate);
+
+	FreeExecutorState(estate);
+
+	/*
+	 * If we skipped writing WAL, then we need to sync the heap (but not
+	 * indexes since those use WAL anyway)
+	 */
+	if (hi_options & HEAP_INSERT_SKIP_WAL)
+		heap_sync(cstate->rel);
+
+	return processed;
+}
+
+/*
+ * Background worker entry point for parallel copy.
+ */
+void ParallelCopyMain(dsm_segment *seg, shm_toc *toc)
+{
+	Form_pg_class relationForm;
+	Relation rel;
+	CopyState cstate;
+
+	relationForm = shm_toc_lookup(toc, 0, false);
+	rel = shm_toc_lookup(toc, 1, false);
+	cstate = shm_toc_lookup(toc, 2, false);
+	rel->rd_att = CreateTemplateTupleDesc(relationForm->relnatts,
+										  relationForm->relhasoids);
+	rel->rd_rel = relationForm;
+	cstate->rel = rel;
+
+	
 }
 
 /*
