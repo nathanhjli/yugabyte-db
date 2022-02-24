@@ -95,6 +95,9 @@ namespace {
 static constexpr const size_t kPgSequenceLastValueColIdx = 2;
 static constexpr const size_t kPgSequenceIsCalledColIdx = 3;
 
+bool has_prev_future = false;
+std::future<client::FlushStatus> prevFlushFuture;
+
 string GetStatusStringSet(const client::CollectedErrors& errors) {
   std::set<string> status_strings;
   for (const auto& error : errors) {
@@ -891,6 +894,16 @@ Status PgSession::FlushBufferedOperationsImpl(const Flusher& flusher) {
   if (!ops.empty()) {
     RETURN_NOT_OK(flusher(std::move(ops), IsTransactionalSession::kFalse));
   }
+  /* Process final prevFlushFuture. */
+  if (has_prev_future)
+  {
+    const auto flush_status = prevFlushFuture.get();
+    RETURN_NOT_OK(CombineErrorsToStatus(flush_status.errors, flush_status.status));
+    for (const auto& buffered_op : ops) {
+      RETURN_NOT_OK(HandleResponse(*buffered_op.operation, buffered_op.relation_id));
+    }
+    has_prev_future = false;
+  }
   if (!txn_ops.empty()) {
     SCHECK(!YBCIsInitDbModeEnvVarSet(),
            IllegalState,
@@ -989,6 +1002,21 @@ Status PgSession::FlushOperations(PgsqlOpBuffer ops, IsTransactionalSession tran
   for (const auto& buffered_op : ops) {
     RETURN_NOT_OK(HandleResponse(*buffered_op.operation, buffered_op.relation_id));
   }
+
+  std::future<client::FlushStatus> curFlushFuture = session->FlushFuture();
+  if (!has_prev_future)
+  {
+    has_prev_future = true;
+  }
+  else
+  {
+    const auto flush_status = prevFlushFuture.get();
+    RETURN_NOT_OK(CombineErrorsToStatus(flush_status.errors, flush_status.status));
+    for (const auto& buffered_op : ops) {
+      RETURN_NOT_OK(HandleResponse(*buffered_op.operation, buffered_op.relation_id));
+    }
+  }
+  prevFlushFuture = std::move(curFlushFuture);
   return Status::OK();
 }
 
