@@ -23,6 +23,7 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "commands/async.h"
+#include "commands/copy.h"
 #include "executor/execParallel.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
@@ -139,7 +140,7 @@ static const struct
 		"_bt_parallel_build_main", _bt_parallel_build_main
 	},
 	{
-		"ParallelCopyMain", 
+		"ParallelCopyMain", ParallelCopyMain
 	}
 };
 
@@ -1255,18 +1256,18 @@ ParallelWorkerMain(Datum main_arg)
 	/* Establish signal handlers. */
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
-
+	ereport(LOG, (errmsg("Parallel main 1")));
 	/* Determine and set our parallel worker number. */
 	Assert(ParallelWorkerNumber == -1);
 	memcpy(&ParallelWorkerNumber, MyBgworkerEntry->bgw_extra, sizeof(int));
-
+	ereport(LOG, (errmsg("Parallel main 2")));
 	/* Set up a memory context and resource owner. */
 	Assert(CurrentResourceOwner == NULL);
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "parallel toplevel");
 	CurrentMemoryContext = AllocSetContextCreate(TopMemoryContext,
 												 "Parallel worker",
 												 ALLOCSET_DEFAULT_SIZES);
-
+	ereport(LOG, (errmsg("Parallel main 3")));
 	/*
 	 * Now that we have a resource owner, we can attach to the dynamic shared
 	 * memory segment and read the table of contents.
@@ -1281,16 +1282,16 @@ ParallelWorkerMain(Datum main_arg)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("invalid magic number in dynamic shared memory segment")));
-
+	ereport(LOG, (errmsg("Parallel main 4")));
 	/* Look up fixed parallel state. */
 	fps = shm_toc_lookup(toc, PARALLEL_KEY_FIXED, false);
 	MyFixedParallelState = fps;
-
+	ereport(LOG, (errmsg("Parallel main 5")));
 	/* Arrange to signal the leader if we exit. */
 	ParallelMasterPid = fps->parallel_master_pid;
 	ParallelMasterBackendId = fps->parallel_master_backend_id;
 	on_shmem_exit(ParallelWorkerShutdown, (Datum) 0);
-
+	ereport(LOG, (errmsg("Parallel main 6")));
 	/*
 	 * Now we can find and attach to the error queue provided for us.  That's
 	 * good, because until we do that, any errors that happen here will not be
@@ -1305,7 +1306,7 @@ ParallelWorkerMain(Datum main_arg)
 	pq_redirect_to_shm_mq(seg, mqh);
 	pq_set_parallel_master(fps->parallel_master_pid,
 						   fps->parallel_master_backend_id);
-
+	ereport(LOG, (errmsg("Parallel main 7")));
 	/*
 	 * Send a BackendKeyData message to the process that initiated parallelism
 	 * so that it has access to our PID before it receives any other messages
@@ -1317,7 +1318,7 @@ ParallelWorkerMain(Datum main_arg)
 	pq_sendint32(&msgbuf, (int32) MyProcPid);
 	pq_sendint32(&msgbuf, (int32) MyCancelKey);
 	pq_endmessage(&msgbuf);
-
+	ereport(LOG, (errmsg("Parallel main 8")));
 	/*
 	 * Hooray! Primary initialization is complete.  Now, we need to set up our
 	 * backend-local state to match the original backend.
@@ -1335,14 +1336,14 @@ ParallelWorkerMain(Datum main_arg)
 	if (!BecomeLockGroupMember(fps->parallel_master_pgproc,
 							   fps->parallel_master_pid))
 		return;
-
+	ereport(LOG, (errmsg("Parallel main 9")));
 	/*
 	 * Restore transaction and statement start-time timestamps.  This must
 	 * happen before anything that would start a transaction, else asserts in
 	 * xact.c will fire.
 	 */
 	SetParallelStartTimestamps(fps->xact_ts, fps->stmt_ts);
-
+	ereport(LOG, (errmsg("Parallel main 10")));
 	/*
 	 * Identify the entry point to be called.  In theory this could result in
 	 * loading an additional library, though most likely the entry point is in
@@ -1353,18 +1354,18 @@ ParallelWorkerMain(Datum main_arg)
 	function_name = entrypointstate + strlen(library_name) + 1;
 
 	entrypt = LookupParallelWorkerFunction(library_name, function_name);
-
+	ereport(LOG, (errmsg("Parallel main 11")));
 	/* Restore database connection. */
 	BackgroundWorkerInitializeConnectionByOid(fps->database_id,
 											  fps->authenticated_user_id,
 											  0);
-
+	ereport(LOG, (errmsg("Parallel main 12")));
 	/*
 	 * Set the client encoding to the database encoding, since that is what
 	 * the leader will expect.
 	 */
 	SetClientEncoding(GetDatabaseEncoding());
-
+	ereport(LOG, (errmsg("Parallel main 13")));
 	/*
 	 * Load libraries that were loaded by original backend.  We want to do
 	 * this before restoring GUCs, because the libraries might define custom
@@ -1391,7 +1392,7 @@ ParallelWorkerMain(Datum main_arg)
 	session_dsm_handle_space =
 		shm_toc_lookup(toc, PARALLEL_KEY_SESSION_DSM, false);
 	AttachSession(*(dsm_handle *) session_dsm_handle_space);
-
+	ereport(LOG, (errmsg("Parallel main 14")));
 	/*
 	 * If the transaction isolation level is REPEATABLE READ or SERIALIZABLE,
 	 * the leader has serialized the transaction snapshot and we must restore
@@ -1411,13 +1412,13 @@ ParallelWorkerMain(Datum main_arg)
 	RestoreTransactionSnapshot(tsnapshot,
 							   fps->parallel_master_pgproc);
 	PushActiveSnapshot(asnapshot);
-
+	ereport(LOG, (errmsg("Parallel main 15")));
 	/*
 	 * We've changed which tuples we can see, and must therefore invalidate
 	 * system caches.
 	 */
 	InvalidateSystemCaches();
-
+	ereport(LOG, (errmsg("Parallel main 16")));
 	/*
 	 * Restore current role id.  Skip verifying whether session user is
 	 * allowed to become this role and blindly restore the leader's state for
@@ -1431,28 +1432,28 @@ ParallelWorkerMain(Datum main_arg)
 	/* Restore temp-namespace state to ensure search path matches leader's. */
 	SetTempNamespaceState(fps->temp_namespace_id,
 						  fps->temp_toast_namespace_id);
-
+	ereport(LOG, (errmsg("Parallel main 17")));
 	/* Restore reindex state. */
 	reindexspace = shm_toc_lookup(toc, PARALLEL_KEY_REINDEX_STATE, false);
 	RestoreReindexState(reindexspace);
-
+	ereport(LOG, (errmsg("Parallel main 18")));
 	/*
 	 * We've initialized all of our state now; nothing should change
 	 * hereafter.
 	 */
 	InitializingParallelWorker = false;
 	EnterParallelMode();
-
+	ereport(LOG, (errmsg("Parallel main 19")));
 	/* Restore enum blacklist. */
 	enumblacklistspace = shm_toc_lookup(toc, PARALLEL_KEY_ENUMBLACKLIST,
 										false);
 	RestoreEnumBlacklist(enumblacklistspace);
-
+	ereport(LOG, (errmsg("Parallel main 20")));
 	/*
 	 * Time to do the real work: invoke the caller-supplied code.
 	 */
 	entrypt(seg, toc);
-
+	ereport(LOG, (errmsg("Parallel main 21")));
 	/* Must exit parallel mode to pop active snapshot. */
 	ExitParallelMode();
 

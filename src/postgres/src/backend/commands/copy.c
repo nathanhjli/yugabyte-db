@@ -1012,6 +1012,11 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			Form_pg_class relform_space;
 			CopyState cstate_space;
 			Relation rel_space;
+			Size tupledesc_size = TupleDescSize(cstate->rel->rd_att);
+			TupleDesc tupledesc_space;
+			List *attnumlist_space;
+			ListCell *l;
+			List *range_table_space;
 
 			/* Perform CopyFromMain so we can fail fast. */
 			CopyFromMain(cstate);
@@ -1026,9 +1031,18 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			shm_toc_estimate_chunk(&pcxt->estimator, CLASS_TUPLE_SIZE);
 			shm_toc_estimate_keys(&pcxt->estimator, 1);
 
-			/* Estimate space for Relation, needed for CopyState */
+			/* Estimate space for TupleDesc, neded for Relation. */
+			shm_toc_estimate_chunk(&pcxt->estimator, tupledesc_size);
+			shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+			/* Estimate space for Relation, needed for CopyState. */
 			shm_toc_estimate_chunk(&pcxt->estimator, sizeof(RelationData));
 			shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+			/* Estimate space for attnumlist, needed for CopyState. */
+
+
+			/* Estimate space for range_table, needed for CopyState. */
 
 			/* Estimate space for CopyState. */
 			shm_toc_estimate_chunk(&pcxt->estimator, sizeof(CopyStateData));
@@ -1037,17 +1051,23 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			/* Everyone's had a chance to ask for space, so now create the DSM. */
 			InitializeParallelDSM(pcxt);
 
-			/* Store Form_pg_class. */
+			/* Store Form_pg_class rd_rel. */
 			relform_space = (FormData_pg_class *) 
 					shm_toc_allocate(pcxt->toc, CLASS_TUPLE_SIZE);
 			memcpy(relform_space, cstate->rel->rd_rel, CLASS_TUPLE_SIZE);
 			shm_toc_insert(pcxt->toc, 0, relform_space);
 
-			/* Store Relation. */
+			/* Store tuple desc. */
+			tupledesc_space = (TupleDesc)
+					shm_toc_allocate(pcxt->toc, tupledesc_size);
+			TupleDescCopy(tupledesc_space, cstate->rel->rd_att);
+			shm_toc_insert(pcxt->toc, 1, tupledesc_space);
+
+			/* Store Relation rel. */
 			rel_space = (RelationData *)
 				shm_toc_allocate(pcxt->toc, sizeof(RelationData));
-			rel_space->rd_rel = relform_space;
-			/* rel->rd_att initialized in worker. */
+			/* rel_space->rd_rel is set in ParallelCopyMain. */
+			/* rel_space->rd_att is set in ParallelCopyMain. */
 			rel_space->rd_id = cstate->rel->rd_id;
 			rel_space->rd_refcnt = cstate->rel->rd_refcnt;
 			rel_space->rd_isnailed = cstate->rel->rd_isnailed;
@@ -1058,13 +1078,24 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			rel_space->rd_oidindex = cstate->rel->rd_oidindex;
 			rel_space->rd_pkindex = cstate->rel->rd_pkindex;
 			rel_space->rd_replidindex = cstate->rel->rd_replidindex;
-			shm_toc_insert(pcxt->toc, 1, rel_space);
+			shm_toc_insert(pcxt->toc, 2, rel_space);
+			
+			/* Store List attnumlist. */
+
+
+			// foreach(l, cstate->attnumlist)
+			// {
+			// 	int attnum = lfirst_int(l);
+			// 	attnumlist_space = lappend_int(attnumlist_space, attnum);
+			// }
+
+			/* Store List range_table. */
 
 			/* Store CopyState, needed for CopyFromWorker. */
 			cstate_space = (CopyStateData *)
 					shm_toc_allocate(pcxt->toc, sizeof(CopyStateData));
+			/* cstate_space->rel is set in ParallelCopyMain. */
 			/* cstate->attnumList = ? */
-			/* cstate->transition_capture_state = ? */
 			/* cstate->range_table = ? */
 			cstate_space->batch_size = cstate->batch_size;
 			cstate_space->freeze = cstate->freeze;
@@ -1072,10 +1103,12 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			cstate_space->cur_lineno = cstate->cur_lineno;
 			cstate_space->cur_attname = cstate->cur_attname;
 			cstate_space->cur_attval = cstate->cur_attval;
-			shm_toc_insert(pcxt->toc, 2, cstate_space);
+			shm_toc_insert(pcxt->toc, 3, cstate_space);
 
 			LaunchParallelWorkers(pcxt);
 
+			WaitForParallelWorkersToFinish(pcxt);
+			DestroyParallelContext(pcxt);
 			ExitParallelMode();
 		}
 		else
@@ -3313,7 +3346,7 @@ HeapTuple	tuple;
 	MemoryContext oldcontext = GetCurrentMemoryContext();
 
 	ErrorContextCallback errcallback;
-	CommandId	mycid = GetCurrentCommandId(true);
+	CommandId	mycid = 0; // GetCurrentCommandId(true);
 	int			hi_options = 0; /* start with default heap_insert options */
 	BulkInsertState bistate;
 	uint64		processed = 0;
@@ -3333,7 +3366,7 @@ HeapTuple	tuple;
 	uint64		firstBufferedLineNo = 0;
 
 	Assert(cstate->rel);
-
+	ereport(LOG, (errmsg("Getting here 1")));
 	tupDesc = RelationGetDescr(cstate->rel);
 
 	/*----------
@@ -3395,7 +3428,7 @@ HeapTuple	tuple;
 		if (!XLogIsNeeded())
 			hi_options |= HEAP_INSERT_SKIP_WAL;
 	}
-
+	ereport(LOG, (errmsg("Getting here 2")));
 	/*
 	 * Optimize if new relfilenode was created in this subxact or one of its
 	 * committed children and we won't see those rows later as part of an
@@ -3447,7 +3480,7 @@ HeapTuple	tuple;
 
 		hi_options |= HEAP_INSERT_FROZEN;
 	}
-
+	ereport(LOG, (errmsg("Getting here 3")));
 	/*
 	 * We need a ResultRelInfo so we can use the regular executor's
 	 * index-entry-making machinery.  (There used to be a huge amount of code
@@ -3459,9 +3492,9 @@ HeapTuple	tuple;
 					  1,		/* dummy rangetable index */
 					  NULL,
 					  0);
-
+	ereport(LOG, (errmsg("Getting here 4")));
 	ExecOpenIndices(resultRelInfo, false);
-
+	ereport(LOG, (errmsg("Getting here 5")));
 	estate->es_result_relations = resultRelInfo;
 	estate->es_num_result_relations = 1;
 	estate->es_result_relation_info = resultRelInfo;
@@ -3471,7 +3504,7 @@ HeapTuple	tuple;
 	myslot = ExecInitExtraTupleSlot(estate, tupDesc);
 	/* Triggers might need a slot as well */
 	estate->es_trig_tuple_slot = ExecInitExtraTupleSlot(estate, NULL);
-
+	ereport(LOG, (errmsg("Getting here 6")));
 	/*
 	 * Set up a ModifyTableState so we can let FDW(s) init themselves for
 	 * foreign-table result relation(s).
@@ -3486,10 +3519,10 @@ HeapTuple	tuple;
 		resultRelInfo->ri_FdwRoutine->BeginForeignInsert != NULL)
 		resultRelInfo->ri_FdwRoutine->BeginForeignInsert(mtstate,
 														 resultRelInfo);
-
+	ereport(LOG, (errmsg("Getting here 7")));
 	/* Prepare to catch AFTER triggers. */
 	AfterTriggerBeginQuery();
-
+	ereport(LOG, (errmsg("Getting here 8")));
 	/*
 	 * If there are any triggers with transition tables on the named relation,
 	 * we need to be prepared to capture transition tuples.
@@ -3498,7 +3531,7 @@ HeapTuple	tuple;
 		MakeTransitionCaptureState(cstate->rel->trigdesc,
 								   RelationGetRelid(cstate->rel),
 								   CMD_INSERT);
-
+	ereport(LOG, (errmsg("Getting here 9")));
 	/*
 	 * If the named relation is a partitioned table, initialize state for
 	 * CopyFrom tuple routing.
@@ -3519,7 +3552,7 @@ HeapTuple	tuple;
 		if (cstate->transition_capture != NULL)
 			ExecSetupChildParentMapForLeaf(proute);
 	}
-
+	ereport(LOG, (errmsg("Getting here 10")));
 	if (isBatchTxnCopy)
 	{
 		/*
@@ -3551,7 +3584,7 @@ HeapTuple	tuple;
 		}
 		cstate->batch_size = batch_size;
 	}
-
+	ereport(LOG, (errmsg("Getting here 11")));
 	/*
 	 * It's more efficient to prepare a bunch of tuples for insertion, and
 	 * insert them in one heap_multi_insert() call, than call heap_insert()
@@ -3575,14 +3608,14 @@ HeapTuple	tuple;
 	{
 		useMultiInsert = true;
 	}
-
+	ereport(LOG, (errmsg("Getting here 12")));
 	useYBMultiInsert = useMultiInsert && IsYBRelation(resultRelInfo->ri_RelationDesc);
 	useHeapMultiInsert = useMultiInsert && !IsYBRelation(resultRelInfo->ri_RelationDesc);
 	if (useHeapMultiInsert)
 	{
 		bufferedTuples = palloc(MAX_BUFFERED_TUPLES * sizeof(HeapTuple));
 	}
-
+	ereport(LOG, (errmsg("Getting here 13")));
 	/*
 	 * Only use non-txn insert if it's explicitly enabled, the relation meets criteria for
 	 * multi insert (e.g. no triggers), and the relation does not have secondary indices.
@@ -3597,7 +3630,7 @@ HeapTuple	tuple;
 	{
 		useNonTxnInsert = false;
 	}
-
+	ereport(LOG, (errmsg("Getting here 14")));
 	/*
 	 * Check BEFORE STATEMENT insertion triggers. It's debatable whether we
 	 * should do this for COPY, since it's not really an "INSERT" statement as
@@ -3605,19 +3638,19 @@ HeapTuple	tuple;
 	 * EACH ROW triggers that we already fire on COPY.
 	 */
 	ExecBSInsertTriggers(estate, resultRelInfo);
-
+	ereport(LOG, (errmsg("Getting here 15")));
 	values = (Datum *) palloc(tupDesc->natts * sizeof(Datum));
 	nulls = (bool *) palloc(tupDesc->natts * sizeof(bool));
-
+	ereport(LOG, (errmsg("Getting here 16")));
 	bistate = GetBulkInsertState();
 	econtext = GetPerTupleExprContext(estate);
-
+	ereport(LOG, (errmsg("Getting here 17")));
 	/* Set up callback to identify error line number */
 	errcallback.callback = CopyFromErrorCallback;
 	errcallback.arg = (void *) cstate;
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
-
+	ereport(LOG, (errmsg("Getting here 18")));
 	/* Warn if non-txn COPY enabled and relation does not meet non-txn criteria. */
 	if (YBIsNonTxnCopyEnabled() && !useNonTxnInsert)
 		ereport(WARNING,
@@ -3626,7 +3659,7 @@ HeapTuple	tuple;
 						"using transactional COPY instead"),
 				 errhint("Non-transactional COPY is not supported on relations with "
 						 "secondary indices or triggers.")));
-
+	ereport(LOG, (errmsg("Getting here 19")));
 	bool has_more_tuples = true;
 	while (has_more_tuples)
 	{
@@ -3640,13 +3673,13 @@ HeapTuple	tuple;
 		{
 			if (IsYBRelation(resultRelInfo->ri_RelationDesc))
 				MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-
+			ereport(LOG, (errmsg("Getting here 20")));
 			TupleTableSlot *slot;
 			bool		skip_tuple;
 			Oid			loaded_oid = InvalidOid;
 
 			CHECK_FOR_INTERRUPTS();
-
+			ereport(LOG, (errmsg("Getting here 21")));
 			if (!IsYBRelation(resultRelInfo->ri_RelationDesc) && nBufferedTuples == 0)
 			{
 				/*
@@ -3656,18 +3689,18 @@ HeapTuple	tuple;
 				 */
 				ResetPerTupleExprContext(estate);
 			}
-
+			ereport(LOG, (errmsg("Getting here 22")));
 			/* Switch into its memory context */
 			if (!IsYBRelation(resultRelInfo->ri_RelationDesc))
 				MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-
-			has_more_tuples = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
+			ereport(LOG, (errmsg("Getting here 23")));
+			has_more_tuples = false;// NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
 			if (!has_more_tuples)
 				break;
-
+			ereport(LOG, (errmsg("Getting here 24")));
 			/* And now we can form the input tuple. */
 			tuple = heap_form_tuple(tupDesc, values, nulls);
-
+			ereport(LOG, (errmsg("Getting here 25")));
 			if (loaded_oid != InvalidOid)
 				HeapTupleSetOid(tuple, loaded_oid);
 
@@ -4029,18 +4062,24 @@ HeapTuple	tuple;
 void ParallelCopyMain(dsm_segment *seg, shm_toc *toc)
 {
 	Form_pg_class relationForm;
+	TupleDesc tupDesc;
 	Relation rel;
 	CopyState cstate;
-
+	ereport(LOG, (errmsg("Main 1")));
 	relationForm = shm_toc_lookup(toc, 0, false);
-	rel = shm_toc_lookup(toc, 1, false);
-	cstate = shm_toc_lookup(toc, 2, false);
-	rel->rd_att = CreateTemplateTupleDesc(relationForm->relnatts,
-										  relationForm->relhasoids);
+	ereport(LOG, (errmsg("Main 2")));
+	tupDesc = shm_toc_lookup(toc, 1, false);
+	ereport(LOG, (errmsg("Main 3")));
+	rel = shm_toc_lookup(toc, 2, false);
+	ereport(LOG, (errmsg("Main 4")));
+	cstate = shm_toc_lookup(toc, 3, false);
+	ereport(LOG, (errmsg("Main 5")));
 	rel->rd_rel = relationForm;
+	ereport(LOG, (errmsg("Main 6")));
+	rel->rd_att = tupDesc;
 	cstate->rel = rel;
 
-	
+	CopyFromWorker(cstate);
 }
 
 /*
