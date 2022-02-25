@@ -54,6 +54,10 @@ extern bool yb_force_global_transaction;
  */
 extern bool suppress_nonpg_logs;
 
+extern int ysql_session_max_batch_size;
+
+extern bool use_async_flush;
+
 typedef struct YBCStatusStruct* YBCStatus;
 
 extern YBCStatus YBCStatusOK;

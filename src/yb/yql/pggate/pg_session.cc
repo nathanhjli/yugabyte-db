@@ -37,6 +37,7 @@
 #include "yb/common/row_mark.h"
 #include "yb/common/schema.h"
 #include "yb/common/transaction_error.h"
+#include "yb/common/ybc_util.h"
 
 #include "yb/docdb/doc_key.h"
 #include "yb/docdb/primitive_value.h"
@@ -68,6 +69,9 @@ TAG_FLAG(ysql_wait_until_index_permissions_timeout_ms, advanced);
 DECLARE_int32(TEST_user_ddl_operation_timeout_sec);
 
 DEFINE_bool(ysql_log_failed_docdb_requests, false, "Log failed docdb requests.");
+
+int ysql_session_max_batch_size = 512;
+bool use_async_flush = false;
 
 namespace yb {
 namespace pggate {
@@ -374,7 +378,7 @@ Status PgSession::RunHelper::Apply(std::shared_ptr<client::YBPgsqlOp> op,
     }
     buffer_.push_back({std::move(op), relation_id_});
     // Flush buffers in case limit of operations in single RPC exceeded.
-    return PREDICT_TRUE(buffered_keys.size() < FLAGS_ysql_session_max_batch_size)
+    return PREDICT_TRUE(buffered_keys.size() < (unsigned long)ysql_session_max_batch_size)
         ? Status::OK()
         : pg_session_.FlushBufferedOperations();
   }
@@ -897,6 +901,7 @@ Status PgSession::FlushBufferedOperationsImpl(const Flusher& flusher) {
   /* Process final prevFlushFuture. */
   if (has_prev_future)
   {
+    CHECK(use_async_flush);
     const auto flush_status = prevFlushFuture.get();
     RETURN_NOT_OK(CombineErrorsToStatus(flush_status.errors, flush_status.status));
     for (const auto& buffered_op : ops) {
@@ -975,7 +980,7 @@ Status PgSession::ApplyOperation(client::YBSession *session,
 }
 
 Status PgSession::FlushOperations(PgsqlOpBuffer ops, IsTransactionalSession transactional) {
-  DCHECK(ops.size() > 0 && ops.size() <= FLAGS_ysql_session_max_batch_size);
+  DCHECK(ops.size() > 0 && ops.size() <= (unsigned long)ysql_session_max_batch_size);
 
   TxnPriorityRequirement txn_priority_requirement = kLowerPriorityRange;
   if (GetIsolationLevel() == PgIsolationLevel::READ_COMMITTED) {
@@ -1003,20 +1008,36 @@ Status PgSession::FlushOperations(PgsqlOpBuffer ops, IsTransactionalSession tran
     RETURN_NOT_OK(HandleResponse(*buffered_op.operation, buffered_op.relation_id));
   }
 
-  std::future<client::FlushStatus> curFlushFuture = session->FlushFuture();
-  if (!has_prev_future)
+  if (use_async_flush)
   {
-    has_prev_future = true;
-  }
-  else
-  {
-    const auto flush_status = prevFlushFuture.get();
-    RETURN_NOT_OK(CombineErrorsToStatus(flush_status.errors, flush_status.status));
-    for (const auto& buffered_op : ops) {
-      RETURN_NOT_OK(HandleResponse(*buffered_op.operation, buffered_op.relation_id));
+    LOG(INFO) << "Start of flush";
+    std::future<client::FlushStatus> curFlushFuture = session->FlushFuture();
+    if (!has_prev_future)
+    {
+      has_prev_future = true;
     }
+    else
+    {
+      LOG(INFO) << "Start of wait";
+      const auto flush_status = prevFlushFuture.get();
+      LOG(INFO) << "End of wait";
+      RETURN_NOT_OK(CombineErrorsToStatus(flush_status.errors, flush_status.status));
+      for (const auto& buffered_op : ops) {
+        RETURN_NOT_OK(HandleResponse(*buffered_op.operation, buffered_op.relation_id));
+      }
+    }
+    prevFlushFuture = std::move(curFlushFuture);
+    LOG(INFO) << "End of flush, moved to previous";
   }
-  prevFlushFuture = std::move(curFlushFuture);
+  else {
+      LOG(INFO) << "Start of wait";
+      const auto flush_status = session->FlushFuture().get();
+      LOG(INFO) << "End of wait";
+      RETURN_NOT_OK(CombineErrorsToStatus(flush_status.errors, flush_status.status));
+      for (const auto& buffered_op : ops) {
+        RETURN_NOT_OK(HandleResponse(*buffered_op.operation, buffered_op.relation_id));
+      }
+  }
   return Status::OK();
 }
 

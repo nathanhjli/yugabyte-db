@@ -874,6 +874,15 @@ static struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"use_async_flush", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("use asnyc flush."),
+			NULL
+		},
+		&use_async_flush,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_indexscan", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of index-scan plans."),
 			NULL
@@ -3354,6 +3363,17 @@ static struct config_int ConfigureNamesInt[] =
 		},
 		&yb_index_state_flags_update_delay,
 		1000, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"ysql_session_max_batch_size", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("ysql session batch size"),
+			NULL,
+			0
+		},
+		&ysql_session_max_batch_size,
+		512, 0, INT_MAX,
 		NULL, NULL, NULL
 	},
 
