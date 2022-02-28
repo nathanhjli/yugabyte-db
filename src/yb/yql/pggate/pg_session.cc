@@ -101,6 +101,7 @@ static constexpr const size_t kPgSequenceIsCalledColIdx = 3;
 
 bool has_prev_future = false;
 std::future<client::FlushStatus> prevFlushFuture;
+PgsqlOpBuffer prevOps;
 
 string GetStatusStringSet(const client::CollectedErrors& errors) {
   std::set<string> status_strings;
@@ -898,22 +899,25 @@ Status PgSession::FlushBufferedOperationsImpl(const Flusher& flusher) {
   if (!ops.empty()) {
     RETURN_NOT_OK(flusher(std::move(ops), IsTransactionalSession::kFalse));
   }
-  /* Process final prevFlushFuture. */
-  if (has_prev_future)
-  {
-    CHECK(use_async_flush);
-    const auto flush_status = prevFlushFuture.get();
-    RETURN_NOT_OK(CombineErrorsToStatus(flush_status.errors, flush_status.status));
-    for (const auto& buffered_op : ops) {
-      RETURN_NOT_OK(HandleResponse(*buffered_op.operation, buffered_op.relation_id));
-    }
-    has_prev_future = false;
-  }
   if (!txn_ops.empty()) {
     SCHECK(!YBCIsInitDbModeEnvVarSet(),
            IllegalState,
            "No transactional operations are expected in the initdb mode");
     RETURN_NOT_OK(flusher(std::move(txn_ops), IsTransactionalSession::kTrue));
+  }
+  return Status::OK();
+}
+
+Status PgSession::ProcessFinalPreviousFlush() {
+  if (has_prev_future)
+  {
+    CHECK(use_async_flush);
+    const auto flush_status = prevFlushFuture.get();
+    RETURN_NOT_OK(CombineErrorsToStatus(flush_status.errors, flush_status.status));
+    for (const auto& buffered_op : prevOps) {
+      RETURN_NOT_OK(HandleResponse(*buffered_op.operation, buffered_op.relation_id));
+    }
+    has_prev_future = false;
   }
   return Status::OK();
 }
@@ -1002,15 +1006,12 @@ Status PgSession::FlushOperations(PgsqlOpBuffer ops, IsTransactionalSession tran
   for (const auto& buffered_op : ops) {
     RETURN_NOT_OK(ApplyOperation(session, transactional, buffered_op));
   }
-  const auto flush_status = session->FlushFuture().get();
-  RETURN_NOT_OK(CombineErrorsToStatus(flush_status.errors, flush_status.status));
-  for (const auto& buffered_op : ops) {
-    RETURN_NOT_OK(HandleResponse(*buffered_op.operation, buffered_op.relation_id));
-  }
+
+  struct timespec start, end;
+  uint64_t delta_us;
 
   if (use_async_flush)
   {
-    LOG(INFO) << "Start of flush";
     std::future<client::FlushStatus> curFlushFuture = session->FlushFuture();
     if (!has_prev_future)
     {
@@ -1018,21 +1019,26 @@ Status PgSession::FlushOperations(PgsqlOpBuffer ops, IsTransactionalSession tran
     }
     else
     {
-      LOG(INFO) << "Start of wait";
+      clock_gettime(CLOCK_MONOTONIC_RAW, &start);
       const auto flush_status = prevFlushFuture.get();
-      LOG(INFO) << "End of wait";
+      clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+      delta_us = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_nsec - start.tv_nsec) / 1000;
+      LOG(INFO) << "Wait time (async flush): " << std::to_string(delta_us);
+
       RETURN_NOT_OK(CombineErrorsToStatus(flush_status.errors, flush_status.status));
-      for (const auto& buffered_op : ops) {
+      for (const auto& buffered_op : prevOps) {
         RETURN_NOT_OK(HandleResponse(*buffered_op.operation, buffered_op.relation_id));
       }
     }
     prevFlushFuture = std::move(curFlushFuture);
-    LOG(INFO) << "End of flush, moved to previous";
+    prevOps = std::move(ops);
   }
   else {
-      LOG(INFO) << "Start of wait";
+      clock_gettime(CLOCK_MONOTONIC_RAW, &start);
       const auto flush_status = session->FlushFuture().get();
-      LOG(INFO) << "End of wait";
+      clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+      delta_us = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_nsec - start.tv_nsec) / 1000;
+      LOG(INFO) << "Wait time (regular flush): " << std::to_string(delta_us);
       RETURN_NOT_OK(CombineErrorsToStatus(flush_status.errors, flush_status.status));
       for (const auto& buffered_op : ops) {
         RETURN_NOT_OK(HandleResponse(*buffered_op.operation, buffered_op.relation_id));

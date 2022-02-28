@@ -1418,6 +1418,7 @@ Status PgApiImpl::RestartReadPoint() {
 Status PgApiImpl::CommitTransaction() {
   pg_session_->InvalidateForeignKeyReferenceCache();
   RETURN_NOT_OK(pg_session_->FlushBufferedOperations());
+  RETURN_NOT_OK(pg_session_->ProcessFinalPreviousFlush());
   return pg_txn_manager_->CommitTransaction();
 }
 

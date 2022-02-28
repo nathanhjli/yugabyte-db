@@ -211,6 +211,8 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
 
   // Flush all pending buffered operations. Buffering mode remain unchanged.
   CHECKED_STATUS FlushBufferedOperations();
+  // Process final previous flush for async flush.
+  CHECKED_STATUS ProcessFinalPreviousFlush();
   // Drop all pending buffered operations. Buffering mode remain unchanged.
   void DropBufferedOperations();
 

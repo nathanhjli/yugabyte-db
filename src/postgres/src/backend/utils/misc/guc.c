@@ -879,7 +879,7 @@ static struct config_bool ConfigureNamesBool[] =
 			NULL
 		},
 		&use_async_flush,
-		true,
+		false,
 		NULL, NULL, NULL
 	},
 	{
