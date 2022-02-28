@@ -770,6 +770,29 @@ heap_copytuple_with_tuple(HeapTuple src, HeapTuple dest)
 	memcpy((char *) dest->t_data, (char *) src->t_data, src->t_len);
 }
 
+/* ----------------
+ *		heap_copytuple_into_shm
+ *
+ *		copy a tuple into a caller-supplied shared memory address
+ * ----------------
+ */
+ void
+ heap_copytuple_into_shm(HeapTuple src, HeapTuple dest)
+ {
+	if (!HeapTupleIsValid(src) || src->t_data == NULL)
+	{
+		dest->t_data = NULL;
+		return;
+	}
+
+	dest->t_len = src->t_len;
+	dest->t_self = src->t_self;
+	dest->t_tableOid = src->t_tableOid;
+	HEAPTUPLE_COPY_YBCTID(src->t_ybctid, dest->t_ybctid);
+	dest->t_data = (HeapTupleHeader) ((char *) dest + HEAPTUPLESIZE);
+	memcpy((char *) dest->t_data, (char *) src->t_data, src->t_len);
+ }
+
 /*
  * Expand a tuple which has less attributes than required. For each attribute
  * not present in the sourceTuple, if there is a missing value that will be

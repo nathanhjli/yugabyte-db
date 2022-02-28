@@ -259,7 +259,8 @@ static Oid YBCExecuteInsertInternal(Oid dboid,
 		Oid   collation_id = YBEncodingCollation(insert_stmt, attnum,
 			ybc_get_attcollation(RelationGetDescr(rel), attnum));
 		Datum datum   = heap_getattr(tuple, attnum, tupleDesc, &is_null);
-
+		// ereport(LOG, (errmsg("attnum \"%d\" is \"%lu\"", attnum, datum)));
+		// ereport(LOG, (errmsg("number of atts is \"%d\"", HeapTupleHeaderGetNatts(tuple->t_data))));
 		/* Check not-null constraint on primary key early */
 		if (is_null && bms_is_member(attnum - minattr, pkey))
 		{

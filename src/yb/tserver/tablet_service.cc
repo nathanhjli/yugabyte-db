@@ -1624,17 +1624,20 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
     uint64_t last_breaking_catalog_version = 0; // unset.
     for (const auto& pg_req : req->pgsql_write_batch()) {
       if (pg_req.has_ysql_catalog_version()) {
+        LOG(ERROR) << "tablet_service last_breaking_catalog_version before check is " << std::to_string(last_breaking_catalog_version);
         if (last_breaking_catalog_version == 0) {
           // Initialize last breaking version if not yet set.
           server_->get_ysql_catalog_version(nullptr /* current_version */,
                                             &last_breaking_catalog_version);
         }
         if (pg_req.ysql_catalog_version() < last_breaking_catalog_version) {
-          SetupErrorAndRespond(resp->mutable_error(),
-              STATUS_SUBSTITUTE(QLError, "The catalog snapshot used for this "
-                                         "transaction has been invalidated."),
-              TabletServerErrorPB::MISMATCHED_SCHEMA, &context);
-          return;
+          LOG(ERROR) << "tablet_service ysql catalog version is " << std::to_string(pg_req.ysql_catalog_version());
+          LOG(ERROR) << "tablet_service last_breaking_catalog_version is " << std::to_string(last_breaking_catalog_version);
+          // SetupErrorAndRespond(resp->mutable_error(),
+          //     STATUS_SUBSTITUTE(QLError, "The catalog snapshot used for this "
+          //                                "transaction has been invalidated."),
+          //     TabletServerErrorPB::MISMATCHED_SCHEMA, &context);
+          // return;
         }
       }
     }

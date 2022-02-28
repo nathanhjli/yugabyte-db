@@ -313,7 +313,7 @@ static uint64 CopyTo(CopyState cstate);
 static void CopyOneRowTo(CopyState cstate, Oid tupleOid,
 			 Datum *values, bool *nulls);
 static void CopyFromMain(CopyState cstate);
-static uint64 CopyFromWorker(CopyState cstate);
+static uint64 CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc);
 static void CopyFromInsertBatch(CopyState cstate, EState *estate,
 					CommandId mycid, int hi_options,
 					ResultRelInfo *resultRelInfo, TupleTableSlot *myslot,
@@ -1014,9 +1014,15 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			Relation rel_space;
 			Size tupledesc_size = TupleDescSize(cstate->rel->rd_att);
 			TupleDesc tupledesc_space;
-			List *attnumlist_space;
-			ListCell *l;
-			List *range_table_space;
+			HeapTuple tuple_space;
+			char *attnumlist_data;
+			int attnumlist_len;
+			char *attnumlist_space;
+			char *rangetable_data;
+			int rangetable_len;
+			char *rangetable_space;
+			int tuples_per_worker = 20;
+			HeapTuple tuples[tuples_per_worker];
 
 			/* Perform CopyFromMain so we can fail fast. */
 			CopyFromMain(cstate);
@@ -1040,12 +1046,57 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			shm_toc_estimate_keys(&pcxt->estimator, 1);
 
 			/* Estimate space for attnumlist, needed for CopyState. */
-
+			attnumlist_data = nodeToString(cstate->attnumlist);
+			attnumlist_len = strlen(attnumlist_data) + 1;
+			shm_toc_estimate_chunk(&pcxt->estimator, attnumlist_len);
+			shm_toc_estimate_keys(&pcxt->estimator, 1);
 
 			/* Estimate space for range_table, needed for CopyState. */
+			rangetable_data = nodeToString(cstate->range_table);
+			rangetable_len = strlen(rangetable_data) + 1;
+			shm_toc_estimate_chunk(&pcxt->estimator, rangetable_len);
+			shm_toc_estimate_keys(&pcxt->estimator, 1);
 
 			/* Estimate space for CopyState. */
 			shm_toc_estimate_chunk(&pcxt->estimator, sizeof(CopyStateData));
+			shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+			/* Estimate space for tuple. */
+			EState *estate = CreateExecutorState();
+			ExprContext *econtext = GetPerTupleExprContext(estate);
+			Oid	loaded_oid = InvalidOid;
+			Datum *values = (Datum *) palloc(cstate->rel->rd_att->natts * sizeof(Datum));
+			bool *nulls = (bool *) palloc(cstate->rel->rd_att->natts * sizeof(bool));
+			bool has_more_tuples = true;
+			HeapTuple tuple;
+			int num_tuples = 0;
+			int *num_tuples_space;
+			Size tuples_size = 0;
+			HeapTuple tuple_address;
+			while (has_more_tuples)
+			{
+				has_more_tuples = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
+				if (!has_more_tuples)
+					break;
+
+				tuple = heap_form_tuple(cstate->rel->rd_att, values, nulls);
+
+				if (loaded_oid != InvalidOid)
+					HeapTupleSetOid(tuple, loaded_oid);
+
+				tuple->t_tableOid = RelationGetRelid(cstate->rel);
+
+				ereport(LOG, (errmsg("tuple \"%d\" has len \"%d\"", num_tuples, tuple->t_len)));
+
+				tuples[num_tuples++] = tuple;
+				tuples_size += tuple->t_len + HEAPTUPLESIZE;
+			}
+
+			shm_toc_estimate_chunk(&pcxt->estimator, tuples_size);
+			shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+			/* Store number of tuples sent too. */
+			shm_toc_estimate_chunk(&pcxt->estimator, sizeof(int));
 			shm_toc_estimate_keys(&pcxt->estimator, 1);
 
 			/* Everyone's had a chance to ask for space, so now create the DSM. */
@@ -1081,33 +1132,53 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			shm_toc_insert(pcxt->toc, 2, rel_space);
 			
 			/* Store List attnumlist. */
-
-
-			// foreach(l, cstate->attnumlist)
-			// {
-			// 	int attnum = lfirst_int(l);
-			// 	attnumlist_space = lappend_int(attnumlist_space, attnum);
-			// }
+			attnumlist_space = shm_toc_allocate(pcxt->toc, attnumlist_len);
+			memcpy(attnumlist_space, attnumlist_data, attnumlist_len);
+			shm_toc_insert(pcxt->toc, 3, attnumlist_space);
 
 			/* Store List range_table. */
+			rangetable_space = shm_toc_allocate(pcxt->toc, rangetable_len);
+			memcpy(rangetable_space, rangetable_data, rangetable_len);
+			shm_toc_insert(pcxt->toc, 4, rangetable_space);
 
 			/* Store CopyState, needed for CopyFromWorker. */
 			cstate_space = (CopyStateData *)
 					shm_toc_allocate(pcxt->toc, sizeof(CopyStateData));
 			/* cstate_space->rel is set in ParallelCopyMain. */
-			/* cstate->attnumList = ? */
-			/* cstate->range_table = ? */
+			/* cstate->attnumlist is set in ParallelCopyMain. */
+			/* cstate->range_table is set in ParallelCopyMain. */
 			cstate_space->batch_size = cstate->batch_size;
 			cstate_space->freeze = cstate->freeze;
 			cstate_space->cur_relname = cstate->cur_relname;
 			cstate_space->cur_lineno = cstate->cur_lineno;
 			cstate_space->cur_attname = cstate->cur_attname;
 			cstate_space->cur_attval = cstate->cur_attval;
-			shm_toc_insert(pcxt->toc, 3, cstate_space);
+			shm_toc_insert(pcxt->toc, 5, cstate_space);
+
+			/* Store HeapTuple. */
+			tuple_space = (HeapTupleData *)
+					shm_toc_allocate(pcxt->toc, tuples_size);
+			tuple_address = tuple_space;
+			for (int tuple_num = 0; tuple_num < num_tuples; tuple_num++)
+			{
+				heap_copytuple_into_shm(tuples[tuple_num], tuple_address);
+				tuple_address += HEAPTUPLESIZE + tuples[tuple_num]->t_len;
+			}
+
+			shm_toc_insert(pcxt->toc, 6, tuple_space);
+
+			/* Store num_tuples. */
+			num_tuples_space = shm_toc_allocate(pcxt->toc, sizeof(int));
+			memcpy(num_tuples_space, &num_tuples, sizeof(int));
+			shm_toc_insert(pcxt->toc, 7, num_tuples_space);
+
+			pfree(values);
+			pfree(nulls);
 
 			LaunchParallelWorkers(pcxt);
 
 			WaitForParallelWorkersToFinish(pcxt);
+
 			DestroyParallelContext(pcxt);
 			ExitParallelMode();
 		}
@@ -2919,7 +2990,7 @@ CopyFrom(CopyState cstate)
 			 * t_tableOid before evaluating them.
 			 */
 			tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
-
+			ereport(LOG, (errmsg("tuple len is \"%d\"", tuple->t_len)));
 			/* Triggers and stuff need to be invoked in query context. */
 			if (!IsYBRelation(resultRelInfo->ri_RelationDesc))
 				MemoryContextSwitchTo(oldcontext);
@@ -3331,9 +3402,9 @@ static void CopyFromMain(CopyState cstate)
  * Copy FROM logic handled by background workers when using parallel copy.
  */
 static uint64 
-CopyFromWorker(CopyState cstate)
+CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 {
-HeapTuple	tuple;
+	HeapTuple	tuple;
 	TupleDesc	tupDesc;
 	Datum	   *values;
 	bool	   *nulls;
@@ -3341,7 +3412,6 @@ HeapTuple	tuple;
 	ResultRelInfo *saved_resultRelInfo = NULL;
 	EState	   *estate = CreateExecutorState(); /* for ExecConstraints() */
 	ModifyTableState *mtstate;
-	ExprContext *econtext;
 	TupleTableSlot *myslot;
 	MemoryContext oldcontext = GetCurrentMemoryContext();
 
@@ -3643,7 +3713,6 @@ HeapTuple	tuple;
 	nulls = (bool *) palloc(tupDesc->natts * sizeof(bool));
 	ereport(LOG, (errmsg("Getting here 16")));
 	bistate = GetBulkInsertState();
-	econtext = GetPerTupleExprContext(estate);
 	ereport(LOG, (errmsg("Getting here 17")));
 	/* Set up callback to identify error line number */
 	errcallback.callback = CopyFromErrorCallback;
@@ -3660,7 +3729,11 @@ HeapTuple	tuple;
 				 errhint("Non-transactional COPY is not supported on relations with "
 						 "secondary indices or triggers.")));
 	ereport(LOG, (errmsg("Getting here 19")));
+	HeapTuple tuple_space = shm_toc_lookup(toc, 6, false);
+	int num_tuples_sent = *(int *)shm_toc_lookup(toc, 7, false);
+	int num_tuples_retrieved = 0;
 	bool has_more_tuples = true;
+	ereport(LOG, (errmsg("Getting here 20")));
 	while (has_more_tuples)
 	{
 		/*
@@ -3673,13 +3746,10 @@ HeapTuple	tuple;
 		{
 			if (IsYBRelation(resultRelInfo->ri_RelationDesc))
 				MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-			ereport(LOG, (errmsg("Getting here 20")));
 			TupleTableSlot *slot;
 			bool		skip_tuple;
-			Oid			loaded_oid = InvalidOid;
 
 			CHECK_FOR_INTERRUPTS();
-			ereport(LOG, (errmsg("Getting here 21")));
 			if (!IsYBRelation(resultRelInfo->ri_RelationDesc) && nBufferedTuples == 0)
 			{
 				/*
@@ -3689,27 +3759,18 @@ HeapTuple	tuple;
 				 */
 				ResetPerTupleExprContext(estate);
 			}
-			ereport(LOG, (errmsg("Getting here 22")));
 			/* Switch into its memory context */
 			if (!IsYBRelation(resultRelInfo->ri_RelationDesc))
 				MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-			ereport(LOG, (errmsg("Getting here 23")));
-			has_more_tuples = false;// NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
+			ereport(LOG, (errmsg("Getting here 21")));
+			has_more_tuples = num_tuples_retrieved < num_tuples_sent;
 			if (!has_more_tuples)
 				break;
-			ereport(LOG, (errmsg("Getting here 24")));
-			/* And now we can form the input tuple. */
-			tuple = heap_form_tuple(tupDesc, values, nulls);
-			ereport(LOG, (errmsg("Getting here 25")));
-			if (loaded_oid != InvalidOid)
-				HeapTupleSetOid(tuple, loaded_oid);
-
-			/*
-			 * Constraints might reference the tableoid column, so initialize
-			 * t_tableOid before evaluating them.
-			 */
-			tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
-
+			
+			tuple = tuple_space;
+			tuple_space += HEAPTUPLESIZE + tuple->t_len;
+			num_tuples_retrieved++;
+			ereport(LOG, (errmsg("Getting here 22")));
 			/* Triggers and stuff need to be invoked in query context. */
 			if (!IsYBRelation(resultRelInfo->ri_RelationDesc))
 				MemoryContextSwitchTo(oldcontext);
@@ -3985,6 +4046,8 @@ HeapTuple	tuple;
 			if (IsYBRelation(cstate->rel))
 				ResetPerTupleExprContext(estate);
 		}
+
+		ereport(LOG, (errmsg("Getting here 27")));
 		/*
 		 * Commit transaction per batch.
 		 * When CopyFrom method is called, we are already inside a transaction block
@@ -4064,22 +4127,51 @@ void ParallelCopyMain(dsm_segment *seg, shm_toc *toc)
 	Form_pg_class relationForm;
 	TupleDesc tupDesc;
 	Relation rel;
+	char *attnumlist_space;
+	List *attnumlist;
+	char *rangetable_space;
+	List *range_table;
 	CopyState cstate;
+
 	ereport(LOG, (errmsg("Main 1")));
+	/* Retrieving data from shared memory. */
 	relationForm = shm_toc_lookup(toc, 0, false);
-	ereport(LOG, (errmsg("Main 2")));
 	tupDesc = shm_toc_lookup(toc, 1, false);
-	ereport(LOG, (errmsg("Main 3")));
 	rel = shm_toc_lookup(toc, 2, false);
-	ereport(LOG, (errmsg("Main 4")));
-	cstate = shm_toc_lookup(toc, 3, false);
-	ereport(LOG, (errmsg("Main 5")));
+	attnumlist_space = shm_toc_lookup(toc, 3, false);
+	attnumlist = (List *) attnumlist_space;
+	rangetable_space = shm_toc_lookup(toc, 4, false);
+	range_table = (List *) rangetable_space;
+	cstate = shm_toc_lookup(toc, 5, false);
+
+	ereport(LOG, (errmsg("Main 2")));
+	/* Setting fields. */
 	rel->rd_rel = relationForm;
-	ereport(LOG, (errmsg("Main 6")));
 	rel->rd_att = tupDesc;
 	cstate->rel = rel;
+	cstate->attnumlist = attnumlist;
+	cstate->range_table = range_table;
 
-	CopyFromWorker(cstate);
+	ereport(LOG, (errmsg("Num atts of cstate in parallelcopymain is \"%d\"", RelationGetNumberOfAttributes(cstate->rel))));
+	ereport(LOG, (errmsg("Main 3")));
+
+	/* To prevent MISSING/NULL primary key value error. */
+	sleep(3);
+	// HeapTuple tuple = shm_toc_lookup(toc, 6, false);
+	// int num_retries = 0;
+	// int MAX_RETRIES = 100;
+	// while (tuple->t_len == 0 && num_retries++ < MAX_RETRIES)
+	// {
+	// 	tuple = shm_toc_lookup(toc, 6, false);
+	// }
+
+	// if (num_retries >= MAX_RETRIES)
+	// {
+	// 	ereport(ERROR, (errmsg("Couldn't load tuples properly, try waiting longer after table creation")));
+	// 	return;
+	// }
+
+	CopyFromWorker(cstate, seg, toc);
 }
 
 /*
