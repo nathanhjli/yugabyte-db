@@ -57,8 +57,8 @@ DEFINE_uint64(ysql_session_max_batch_size, 512,
               "Maximum batch size for buffered writes between PostgreSQL server and YugaByte DocDB "
               "services");
 
-DEFINE_bool(ysql_use_async_flush, true,
-              "Whether to perform async flush");
+DEFINE_bool(yb_use_async_flush, true,
+            "Whether to perform async flush");
 
 DEFINE_bool(ysql_non_txn_copy, false,
             "Execute COPY inserts non-transactionally.");

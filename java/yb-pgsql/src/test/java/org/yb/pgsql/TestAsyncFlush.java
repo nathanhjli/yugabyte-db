@@ -49,17 +49,18 @@ public class TestAsyncFlush extends BasePgSQLTest {
     try (Statement statement = connection.createStatement()) {
       statement.execute(String.format("CREATE TABLE %s (a int PRIMARY KEY, b int, c int)",
                                       tableName));
-      statement.execute(String.format(
-          "COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)",
-          tableName, absFilePath));
+      statement.execute(String.format("COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)",
+                                      tableName, absFilePath));
 
       // Verify row count.
       assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, totalLines);
 
       // Verify specific rows are present.
       assertOneRow(statement, "SELECT * FROM " + tableName + " WHERE a=0", 0, 0, 0);
-      assertOneRow(statement, "SELECT * FROM " + tableName + " WHERE a=50000", 50000, 50000, 50000);
-      assertOneRow(statement, "SELECT * FROM " + tableName + " WHERE a=99999", 99999, 99999, 99999);
+      assertOneRow(statement, "SELECT * FROM " + tableName + " WHERE a=50000",
+                   50000, 50000, 50000);
+      assertOneRow(statement, "SELECT * FROM " + tableName + " WHERE a=99999",
+                   99999, 99999, 99999);
     }
   }
 
@@ -72,29 +73,30 @@ public class TestAsyncFlush extends BasePgSQLTest {
     createDataFile(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
-        statement.execute(String.format("CREATE TABLE %s (a int PRIMARY KEY, b int, c int)",
-                                        tableName));
-        statement.execute(String.format("CREATE INDEX index_1 ON %s(b) WHERE b < 30", tableName));
-        statement.execute(String.format("CREATE INDEX index_2 ON %s(b,c)", tableName));
-        statement.execute(String.format(
-            "COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)",
-            tableName, absFilePath));
-  
-        // Verify row count.
-        assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, totalLines);
-  
-        // Verify specific rows are present.
-        assertOneRow(statement, "SELECT * FROM " + tableName + " WHERE a=0", 0, 0, 0);
-        assertOneRow(statement, "SELECT * FROM " + tableName + " WHERE a=50000", 50000, 50000, 50000);
-        assertOneRow(statement, "SELECT * FROM " + tableName + " WHERE a=99999", 99999, 99999, 99999);
+      statement.execute(String.format("CREATE TABLE %s (a int PRIMARY KEY, b int, c int)",
+                                      tableName));
+      statement.execute(String.format("CREATE INDEX index_1 ON %s(b) WHERE b < 30", tableName));
+      statement.execute(String.format("CREATE INDEX index_2 ON %s(b,c)", tableName));
+      statement.execute(String.format("COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)",
+                                      tableName, absFilePath));
 
-        // Verify index_1.
-        assertOneRow(statement, String.format(
-            "WITH w AS (SELECT * FROM %s WHERE b < 30) SELECT COUNT(*) FROM w;", tableName), 30);
+      // Verify row count.
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, totalLines);
 
-        // Verify index_2.
-        assertOneRow(statement, String.format(
-            "WITH w AS (SELECT * FROM %s) SELECT COUNT(*) FROM w;", tableName), totalLines);
+      // Verify specific rows are present.
+      assertOneRow(statement, "SELECT * FROM " + tableName + " WHERE a=0", 0, 0, 0);
+      assertOneRow(statement, "SELECT * FROM " + tableName + " WHERE a=50000",
+                   50000, 50000, 50000);
+      assertOneRow(statement, "SELECT * FROM " + tableName + " WHERE a=99999",
+                   99999, 99999, 99999);
+
+      // Verify index_1.
+      assertOneRow(statement, String.format(
+          "WITH w AS (SELECT * FROM %s WHERE b < 30) SELECT COUNT(*) FROM w;", tableName), 30);
+
+      // Verify index_2.
+      assertOneRow(statement, String.format(
+          "WITH w AS (SELECT * FROM %s) SELECT COUNT(*) FROM w;", tableName), totalLines);
     }
   }
 }

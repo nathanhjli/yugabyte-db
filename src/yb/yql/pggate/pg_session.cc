@@ -70,6 +70,10 @@ DECLARE_int32(TEST_user_ddl_operation_timeout_sec);
 
 DEFINE_bool(ysql_log_failed_docdb_requests, false, "Log failed docdb requests.");
 
+// If this is set in the user's session to a positive value, it will supersede the gflag
+// ysql_session_max_batch_size.
+int ysql_session_max_batch_size = 0;
+
 namespace yb {
 namespace pggate {
 
@@ -148,6 +152,13 @@ bool IsTableUsedByOperation(const PgsqlOp& op, const string& table_id) {
   }
 }
 
+/* Use the gflag value if the session variable is unset. */
+uint64_t GetSessionMaxBatchSize() {
+    return ysql_session_max_batch_size <= 0
+        ? FLAGS_ysql_session_max_batch_size
+        : (uint64_t) ysql_session_max_batch_size;
+}
+
 struct PgForeignKeyReferenceLightweight {
   PgOid table_id;
   Slice ybctid;
@@ -217,7 +228,7 @@ Status PgSession::RunHelper::Apply(
   auto& buffered_keys = pg_session_.buffered_keys_;
   bool can_buffer = operations_.empty() && pg_session_.buffering_enabled_ &&
     !force_non_bufferable && op->is_write();
-  UseAsyncFlush use_async_flush_(FLAGS_ysql_use_async_flush && can_buffer);
+  UseAsyncFlush use_async_flush_(FLAGS_yb_use_async_flush && can_buffer);
   // Try buffering this operation if it is a write operation, buffering is enabled and no
   // operations have been already applied to current session (yb session does not exist).
   if (can_buffer) {
@@ -237,7 +248,7 @@ Status PgSession::RunHelper::Apply(
     }
     buffer_.Add(op, relation_id_);
     // Flush buffers in case limit of operations in single RPC exceeded.
-    return PREDICT_TRUE(buffered_keys.size() < FLAGS_ysql_session_max_batch_size)
+    return PREDICT_TRUE(buffered_keys.size() < GetSessionMaxBatchSize())
         ? Status::OK()
         : pg_session_.FlushBufferedOperations(use_async_flush_);
   }
@@ -658,7 +669,7 @@ Result<bool> PgSession::IsInitDbDone() {
 
 Status PgSession::FlushOperations(BufferableOperations ops, IsTransactionalSession transactional,
                                   UseAsyncFlush use_async_flush) {
-  DCHECK(ops.size() > 0 && ops.size() <= FLAGS_ysql_session_max_batch_size);
+  DCHECK(ops.size() > 0 && ops.size() <= GetSessionMaxBatchSize());
 
   if (PREDICT_FALSE(yb_debug_log_docdb_requests)) {
     LOG(INFO) << "Flushing buffered operations, using "
@@ -746,17 +757,17 @@ Result<bool> PgSession::ForeignKeyReferenceExists(PgOid table_id,
     return false;
   }
   std::vector<Slice> ybctids;
-  const auto reserved_size = std::min<size_t>(FLAGS_ysql_session_max_batch_size,
+  const auto reserved_size = std::min<size_t>(GetSessionMaxBatchSize(),
                                               fk_reference_intent_.size() + 1);
   ybctids.reserve(reserved_size);
   ybctids.push_back(ybctid);
-  // TODO(dmitry): In case number of keys for same table > FLAGS_ysql_session_max_batch_size
+  // TODO(dmitry): In case number of keys for same table > session max batch size
   // two strategy are possible:
   // 1. select keys belonging to same tablet to reduce number of simultaneous RPC
   // 2. select keys belonging to different tablets to distribute reads among different nodes
   const auto intent_match = [table_id](const auto& key) { return key.table_id == table_id; };
   for (auto it = fk_reference_intent_.begin();
-       it != fk_reference_intent_.end() && ybctids.size() < FLAGS_ysql_session_max_batch_size;
+       it != fk_reference_intent_.end() && ybctids.size() < GetSessionMaxBatchSize();
        ++it) {
     if (intent_match(*it)) {
       ybctids.push_back(it->ybctid);
