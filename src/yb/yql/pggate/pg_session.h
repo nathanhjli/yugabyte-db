@@ -98,6 +98,7 @@ class RowIdentifier {
 };
 
 YB_STRONGLY_TYPED_BOOL(IsTransactionalSession);
+YB_STRONGLY_TYPED_BOOL(UseAsyncFlush);
 YB_STRONGLY_TYPED_BOOL(IsReadOnlyOperation);
 YB_STRONGLY_TYPED_BOOL(IsCatalogOperation);
 
@@ -207,7 +208,9 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
   void ResetOperationsBuffering();
 
   // Flush all pending buffered operations. Buffering mode remain unchanged.
-  CHECKED_STATUS FlushBufferedOperations();
+  CHECKED_STATUS FlushBufferedOperations(UseAsyncFlush use_async_flush);
+  // Process previous flush for async flush.
+  CHECKED_STATUS ProcessPreviousFlush();
   // Drop all pending buffered operations. Buffering mode remain unchanged.
   void DropBufferedOperations();
 
@@ -319,10 +322,13 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
   CHECKED_STATUS RollbackSubTransaction(SubTransactionId id);
 
  private:
-  using Flusher = std::function<Status(BufferableOperations, IsTransactionalSession)>;
+  using Flusher = std::function<Status(BufferableOperations, IsTransactionalSession,
+                                       UseAsyncFlush)>;
 
-  CHECKED_STATUS FlushBufferedOperationsImpl(const Flusher& flusher);
-  CHECKED_STATUS FlushOperations(BufferableOperations ops, IsTransactionalSession transactional);
+  CHECKED_STATUS FlushBufferedOperationsImpl(const Flusher& flusher,
+                                             UseAsyncFlush use_async_flush);
+  CHECKED_STATUS FlushOperations(BufferableOperations ops, IsTransactionalSession transactional,
+                                 UseAsyncFlush use_async_flush);
 
   // Run multiple operations.
   template<class Op>
@@ -399,6 +405,10 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
   BufferableOperations buffered_ops_;
   BufferableOperations buffered_txn_ops_;
   std::unordered_set<RowIdentifier, boost::hash<RowIdentifier>> buffered_keys_;
+
+  // Async flush.
+  bool has_prev_future_;
+  PerformFuture prev_flush_future_;
 
   HybridTime in_txn_limit_;
   bool use_catalog_session_ = false;

@@ -55,8 +55,6 @@
 #include "pg_yb_utils.h"
 #include "executor/ybcModifyTable.h"
 
-
-
 #define ISOCTAL(c) (((c) >= '0') && ((c) <= '7'))
 #define OCTVALUE(c) ((c) - '0')
 
