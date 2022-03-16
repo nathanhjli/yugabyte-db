@@ -1039,7 +1039,6 @@ void PgApiImpl::ResetOperationsBuffering() {
 }
 
 Status PgApiImpl::FlushBufferedOperations() {
-  RETURN_NOT_OK(pg_session_->ProcessPreviousFlush());
   return pg_session_->FlushBufferedOperations(UseAsyncFlush::kFalse);
 }
 
@@ -1428,7 +1427,6 @@ Status PgApiImpl::RestartReadPoint() {
 
 Status PgApiImpl::CommitTransaction() {
   pg_session_->InvalidateForeignKeyReferenceCache();
-  RETURN_NOT_OK(pg_session_->ProcessPreviousFlush());
   RETURN_NOT_OK(pg_session_->FlushBufferedOperations(UseAsyncFlush::kFalse));
   return pg_txn_manager_->CommitTransaction();
 }
@@ -1457,14 +1455,12 @@ Status PgApiImpl::SetTransactionDeferrable(bool deferrable) {
 
 Status PgApiImpl::EnterSeparateDdlTxnMode() {
   // Flush all buffered operations as ddl txn use its own transaction session.
-  RETURN_NOT_OK(pg_session_->ProcessPreviousFlush());
   RETURN_NOT_OK(pg_session_->FlushBufferedOperations(UseAsyncFlush::kFalse));
   return pg_txn_manager_->EnterSeparateDdlTxnMode();
 }
 
 Status PgApiImpl::ExitSeparateDdlTxnMode() {
   // Flush all buffered operations as ddl txn use its own transaction session.
-  RETURN_NOT_OK(pg_session_->ProcessPreviousFlush());
   RETURN_NOT_OK(pg_session_->FlushBufferedOperations(UseAsyncFlush::kFalse));
   RETURN_NOT_OK(pg_txn_manager_->ExitSeparateDdlTxnMode(Commit::kTrue));
   // Next reads from catalog tables have to see changes made by the DDL transaction.
@@ -1478,7 +1474,6 @@ void PgApiImpl::ClearSeparateDdlTxnMode() {
 }
 
 Status PgApiImpl::SetActiveSubTransaction(SubTransactionId id) {
-  RETURN_NOT_OK(pg_session_->ProcessPreviousFlush());
   RETURN_NOT_OK(pg_session_->FlushBufferedOperations(UseAsyncFlush::kFalse));
   return pg_session_->SetActiveSubTransaction(id);
 }

@@ -254,7 +254,6 @@ Status PgSession::RunHelper::Apply(
   }
   bool read_only = op->is_read();
   // Flush all buffered operations (if any) before performing non-bufferable operation
-  RETURN_NOT_OK(pg_session_.ProcessPreviousFlush());
   if (!buffered_keys.empty()) {
     SCHECK(operations_.empty(),
            IllegalState,
@@ -268,7 +267,7 @@ Status PgSession::RunHelper::Apply(
       full_flush_required = IsTableUsedByOperation(*op, i->table_id());
     }
     if (full_flush_required) {
-      RETURN_NOT_OK(pg_session_.FlushBufferedOperations(use_async_flush_));
+      RETURN_NOT_OK(pg_session_.FlushBufferedOperations(UseAsyncFlush::kFalse));
     } else {
       RETURN_NOT_OK(pg_session_.FlushBufferedOperationsImpl(
           [this](auto ops, auto transactional, auto use_async_flush) -> Status {
@@ -277,8 +276,9 @@ Status PgSession::RunHelper::Apply(
               operations_.Swap(&ops);
               return Status::OK();
             }
-            return pg_session_.FlushOperations(std::move(ops), transactional, use_async_flush);
-          }, use_async_flush_));
+            return pg_session_.FlushOperations(std::move(ops), transactional,
+                                               UseAsyncFlush::kFalse);
+          }, UseAsyncFlush::kFalse));
       read_only = read_only && operations_.empty();
     }
   }
@@ -580,7 +580,6 @@ Status PgSession::StartOperationsBuffering() {
 Status PgSession::StopOperationsBuffering() {
   SCHECK(buffering_enabled_, IllegalState, "Buffering hasn't been started");
   buffering_enabled_ = false;
-  RETURN_NOT_OK(ProcessPreviousFlush());
   return FlushBufferedOperations(UseAsyncFlush::kFalse);
 }
 
@@ -624,16 +623,11 @@ Status PgSession::FlushBufferedOperationsImpl(const Flusher& flusher,
            "No transactional operations are expected in the initdb mode");
     RETURN_NOT_OK(flusher(std::move(txn_ops), IsTransactionalSession::kTrue, use_async_flush));
   }
-  return Status::OK();
-}
-
-Status PgSession::ProcessPreviousFlush() {
-  Status flush_status;
-  if (has_prev_future_) {
-    flush_status = prev_flush_future_.Get();
+  if (!use_async_flush and has_prev_future_) {
     has_prev_future_ = false;
+    return prev_flush_future_.Get();
   }
-  return flush_status;
+  return Status::OK();
 }
 
 Result<bool> PgSession::ShouldHandleTransactionally(const PgTableDesc& table, const PgsqlOp& op) {
@@ -694,11 +688,21 @@ Status PgSession::FlushOperations(BufferableOperations ops, IsTransactionalSessi
   PerformFuture future(promise->get_future(), this, &ops.relations);
   Status flush_status;
   if (use_async_flush) {
-    flush_status = ProcessPreviousFlush();
+    if (has_prev_future_) {
+      flush_status = prev_flush_future_.Get();
+    }
     prev_flush_future_ = std::move(future);
     has_prev_future_ = true;
   } else {
+    Status prev_flush_status;
+    if (has_prev_future_) {
+      has_prev_future_ = false;
+      prev_flush_status = prev_flush_future_.Get();
+    }
     flush_status = future.Get();
+    if (!prev_flush_status.ok()) {
+      return prev_flush_status;
+    }
   }
   return flush_status;
 }
@@ -862,7 +866,6 @@ Status PgSession::SetActiveSubTransaction(SubTransactionId id) {
   // ensuring that previous operations use previous SubTransactionMetadata. If we do not flush here,
   // already queued operations may incorrectly use this newly modified SubTransactionMetadata when
   // they are eventually sent to DocDB.
-  RETURN_NOT_OK(ProcessPreviousFlush());
   RETURN_NOT_OK(FlushBufferedOperations(UseAsyncFlush::kFalse));
   tserver::PgPerformOptionsPB* options_ptr = nullptr;
   tserver::PgPerformOptionsPB options;
@@ -884,7 +887,6 @@ Status PgSession::RollbackSubTransaction(SubTransactionId id) {
   // eventually send this metadata.
   // See comment in SetActiveSubTransaction -- we must flush buffered operations before updating any
   // SubTransactionMetadata.
-  RETURN_NOT_OK(ProcessPreviousFlush());
   RETURN_NOT_OK(FlushBufferedOperations(UseAsyncFlush::kFalse));
   return pg_client_.RollbackSubTransaction(id);
 }

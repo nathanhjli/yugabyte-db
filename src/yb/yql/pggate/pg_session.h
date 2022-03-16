@@ -209,8 +209,6 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
 
   // Flush all pending buffered operations. Buffering mode remain unchanged.
   CHECKED_STATUS FlushBufferedOperations(UseAsyncFlush use_async_flush);
-  // Process previous flush for async flush.
-  CHECKED_STATUS ProcessPreviousFlush();
   // Drop all pending buffered operations. Buffering mode remain unchanged.
   void DropBufferedOperations();
 
@@ -407,6 +405,8 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
   std::unordered_set<RowIdentifier, boost::hash<RowIdentifier>> buffered_keys_;
 
   // Async flush.
+  // We store a previous PerformFuture and retrieve their response in the future to reduce
+  // the amount of time spent synchronously waiting.
   bool has_prev_future_;
   PerformFuture prev_flush_future_;
 
