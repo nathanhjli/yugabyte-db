@@ -689,7 +689,9 @@ Status PgSession::FlushOperations(BufferableOperations ops, IsTransactionalSessi
   Status flush_status;
   if (use_async_flush) {
     if (has_prev_future_) {
+      auto start_time = MonoTime::Now();
       flush_status = prev_flush_future_.Get();
+      total_wait_time_ += MonoTime::Now() - start_time;
     }
     prev_flush_future_ = std::move(future);
     has_prev_future_ = true;
@@ -697,9 +699,13 @@ Status PgSession::FlushOperations(BufferableOperations ops, IsTransactionalSessi
     Status prev_flush_status;
     if (has_prev_future_) {
       has_prev_future_ = false;
+      auto start_time = MonoTime::Now();
       prev_flush_status = prev_flush_future_.Get();
+      total_wait_time_ += MonoTime::Now() - start_time;
     }
+    auto start_time = MonoTime::Now();
     flush_status = future.Get();
+    total_wait_time_ += MonoTime::Now() - start_time;
     if (!prev_flush_status.ok()) {
       return prev_flush_status;
     }

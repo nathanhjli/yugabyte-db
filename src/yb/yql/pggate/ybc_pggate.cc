@@ -928,6 +928,10 @@ YBCStatus YBCPgRestartTransaction() {
   return ToYBCStatus(pgapi->RestartTransaction());
 }
 
+uint64_t YBCPgGetTotalWaitTimeMs() {
+  return pgapi->GetTotalWaitTime().ToMilliseconds();
+}
+
 YBCStatus YBCPgResetTransactionReadPoint() {
   return ToYBCStatus(pgapi->ResetTransactionReadPoint());
 }

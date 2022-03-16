@@ -537,6 +537,14 @@ YBCRestartTransaction()
 	HandleYBStatus(YBCPgRestartTransaction());
 }
 
+uint64_t
+YBCGetTotalWaitTimeMs()
+{
+	if (!IsYugaByteEnabled())
+		return 0;
+	return YBCPgGetTotalWaitTimeMs();
+}
+
 void
 YBCCommitTransaction()
 {
