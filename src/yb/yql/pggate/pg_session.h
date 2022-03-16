@@ -410,7 +410,7 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
   // Async flush.
   // We store a previous PerformFuture and retrieve their response in the future to reduce
   // the amount of time spent synchronously waiting.
-  bool has_prev_future_;
+  bool has_prev_future_ = false;
   PerformFuture prev_flush_future_;
 
   HybridTime in_txn_limit_;
