@@ -889,6 +889,7 @@ shm_mq_send_bytes(shm_mq_handle *mqh, Size nbytes, const void *data,
 		if (mq->mq_detached)
 		{
 			*bytes_written = sent;
+			ereport(LOG, (errmsg("res is SHM_MQ_DETACHED")));
 			return SHM_MQ_DETACHED;
 		}
 
@@ -916,6 +917,7 @@ shm_mq_send_bytes(shm_mq_handle *mqh, Size nbytes, const void *data,
 			{
 				mq->mq_detached = true;
 				*bytes_written = sent;
+				ereport(LOG, (errmsg("res is SHM_MQ_DETACHED 2")));
 				return SHM_MQ_DETACHED;
 			}
 			mqh->mqh_counterparty_attached = true;
@@ -939,6 +941,7 @@ shm_mq_send_bytes(shm_mq_handle *mqh, Size nbytes, const void *data,
 			if (nowait)
 			{
 				*bytes_written = sent;
+				ereport(LOG, (errmsg("res is SHM_MQ_WOULD_BLOCK")));
 				return SHM_MQ_WOULD_BLOCK;
 			}
 

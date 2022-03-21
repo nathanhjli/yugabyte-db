@@ -26,6 +26,7 @@
 #include "catalog/dependency.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_type.h"
+#include "catalog/yb_catalog_version.h"
 #include "commands/copy.h"
 #include "commands/defrem.h"
 #include "commands/trigger.h"
@@ -313,7 +314,8 @@ static uint64 CopyTo(CopyState cstate);
 static void CopyOneRowTo(CopyState cstate, Oid tupleOid,
 			 Datum *values, bool *nulls);
 static void CopyFromMain(CopyState cstate);
-static uint64 CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc);
+static uint64 CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
+							 shm_mq_handle *input, shm_mq_handle *output);
 static void CopyFromInsertBatch(CopyState cstate, EState *estate,
 					CommandId mycid, int hi_options,
 					ResultRelInfo *resultRelInfo, TupleTableSlot *myslot,
@@ -1021,8 +1023,15 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			char *rangetable_data;
 			int rangetable_len;
 			char *rangetable_space;
-			int tuples_per_worker = 20;
-			HeapTuple tuples[tuples_per_worker];
+			uint64 total_processed = 0;
+			shm_mq *inq;
+			shm_mq *outq;
+			shm_mq_handle *input;
+			shm_mq_handle *output;
+			int queue_size = 100000;
+
+			ereport(LOG, (errmsg("catalog version in main process is \"%llu\"", yb_catalog_cache_version)));
+			ereport(LOG, (errmsg("master catalog version in main process is \"%llu\"", YbGetMasterCatalogVersion())));
 
 			/* Perform CopyFromMain so we can fail fast. */
 			CopyFromMain(cstate);
@@ -1061,6 +1070,14 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			shm_toc_estimate_chunk(&pcxt->estimator, sizeof(CopyStateData));
 			shm_toc_estimate_keys(&pcxt->estimator, 1);
 
+			/* Estimate space for in queue. */
+			shm_toc_estimate_chunk(&pcxt->estimator, queue_size);
+			shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+			/* Estimate space for out queue. */
+			shm_toc_estimate_chunk(&pcxt->estimator, queue_size);
+			shm_toc_estimate_keys(&pcxt->estimator, 1);
+
 			/* Estimate space for tuple. */
 			EState *estate = CreateExecutorState();
 			ExprContext *econtext = GetPerTupleExprContext(estate);
@@ -1070,33 +1087,10 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			bool has_more_tuples = true;
 			HeapTuple tuple;
 			int num_tuples = 0;
-			int *num_tuples_space;
-			Size tuples_size = 0;
+			Size tuplespace_size = 10000;
+			HeapTuple tuples[tuplespace_size];
 			HeapTuple tuple_address;
-			while (has_more_tuples)
-			{
-				has_more_tuples = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
-				if (!has_more_tuples)
-					break;
-
-				tuple = heap_form_tuple(cstate->rel->rd_att, values, nulls);
-
-				if (loaded_oid != InvalidOid)
-					HeapTupleSetOid(tuple, loaded_oid);
-
-				tuple->t_tableOid = RelationGetRelid(cstate->rel);
-
-				ereport(LOG, (errmsg("tuple \"%d\" has len \"%d\"", num_tuples, tuple->t_len)));
-
-				tuples[num_tuples++] = tuple;
-				tuples_size += tuple->t_len + HEAPTUPLESIZE;
-			}
-
-			shm_toc_estimate_chunk(&pcxt->estimator, tuples_size);
-			shm_toc_estimate_keys(&pcxt->estimator, 1);
-
-			/* Store number of tuples sent too. */
-			shm_toc_estimate_chunk(&pcxt->estimator, sizeof(int));
+			shm_toc_estimate_chunk(&pcxt->estimator, tuplespace_size);	
 			shm_toc_estimate_keys(&pcxt->estimator, 1);
 
 			/* Everyone's had a chance to ask for space, so now create the DSM. */
@@ -1155,32 +1149,165 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			cstate_space->cur_attval = cstate->cur_attval;
 			shm_toc_insert(pcxt->toc, 5, cstate_space);
 
-			/* Store HeapTuple. */
-			tuple_space = (HeapTupleData *)
-					shm_toc_allocate(pcxt->toc, tuples_size);
-			tuple_address = tuple_space;
-			for (int tuple_num = 0; tuple_num < num_tuples; tuple_num++)
+			/* Store inq. */
+			inq = shm_mq_create(shm_toc_allocate(pcxt->toc, queue_size), queue_size);
+			shm_toc_insert(pcxt->toc, 6, inq);
+			shm_mq_set_receiver(inq, MyProc);
+			input = shm_mq_attach(inq, pcxt->seg, NULL);
+
+			/* Store outq. */
+			outq = shm_mq_create(shm_toc_allocate(pcxt->toc, queue_size), queue_size);
+			shm_toc_insert(pcxt->toc, 7, outq);
+			shm_mq_set_sender(outq, MyProc);
+			output = shm_mq_attach(outq, pcxt->seg, NULL);
+
+			/* Store HeapTuples space. */
+			tuple_space = (HeapTuple) shm_toc_allocate(pcxt->toc, tuplespace_size);
+			ereport(LOG, (errmsg("tuple_space is originally \"%p\"", tuple_space)));
+			shm_toc_insert(pcxt->toc, 8, tuple_space);
+
+			ereport(LOG, (errmsg("Launching background workers")));
+			LaunchParallelWorkers(pcxt);
+			ereport(LOG, (errmsg("Waiting for workers to attach.")));
+			/* Wait for workers to attach. */
+			for (;;)
 			{
-				heap_copytuple_into_shm(tuples[tuple_num], tuple_address);
-				tuple_address += HEAPTUPLESIZE + tuples[tuple_num]->t_len;
+				CHECK_FOR_INTERRUPTS();
+				if (shm_mq_get_sender(inq) != NULL && shm_mq_get_receiver(outq) != NULL)
+				{
+					break;
+				}
+			}
+			ereport(LOG, (errmsg("Workers have attached, beginning tuple writing")));
+			/* Write HeapTuples to shared memory space. */
+			Size tuples_size = 0;
+			bool has_written = false;
+			while (has_more_tuples)
+			{
+				CHECK_FOR_INTERRUPTS();
+
+				has_more_tuples = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
+				if (has_more_tuples)
+				{
+					tuple = heap_form_tuple(cstate->rel->rd_att, values, nulls);
+					if (loaded_oid != InvalidOid)
+						HeapTupleSetOid(tuple, loaded_oid);
+					tuple->t_tableOid = RelationGetRelid(cstate->rel);
+				}
+	
+				if (!has_more_tuples || tuples_size + tuple->t_len + HEAPTUPLESIZE > tuplespace_size)
+				{
+					/* 
+					 * If we've written to this worker before, we need to check the response before
+					 * sending the next batch.
+					 */
+					if (has_written)
+					{
+						shm_mq_result res;
+						Size		nbytes;
+						void	   *data;
+						ereport(LOG, (errmsg("Main trying to receive response from worker.")));
+						res = shm_mq_receive(input, &nbytes, &data, false);
+						if (res == SHM_MQ_SUCCESS)
+						{
+							total_processed += *(int *)data;
+						}
+						else
+						{
+							ereport(ERROR, (errmsg("Main worker receiving could not receive response from background worker.")));
+						}
+					}
+
+					/* If no more space, send the current batch of tuples to the worker. */
+					tuple_address = tuple_space;
+					for (int tuple_num = 0; tuple_num < num_tuples; tuple_num++)
+					{
+						heap_copytuple_into_shm(tuples[tuple_num], tuple_address);
+						tuple_address = (HeapTuple) ((char *) tuple_address + HEAPTUPLESIZE + tuples[tuple_num]->t_len);
+						heap_freetuple(tuples[tuple_num]);
+					}
+					ereport(LOG, (errmsg("tuple_space is \"%p\"", tuple_space)));
+					ereport(LOG, (errmsg("tuple_space->t_data is \"%p\"", tuple_space->t_data)));
+					ereport(LOG, (errmsg("tuple_space->t_infomask2 is \"%p\"", &tuple_space->t_data->t_infomask2)));
+
+					ereport(LOG, (errmsg("tuple_space infomask2 is \"%d\"", tuple_space->t_data->t_infomask2)));
+					ereport(LOG, (errmsg("tuple_space infomask is \"%d\"", tuple_space->t_data->t_infomask)));
+					ereport(LOG, (errmsg("tuple_space hoff is \"%d\"", tuple_space->t_data->t_hoff)));
+					ereport(LOG, (errmsg("tuple_space tchoice is \"%s\"", tuple_space->t_data->t_bits)));
+
+					/* Signal to background worker that tuples are written. */
+					/* Main process will send number of tuples sent through the queue. */
+					/* Background worker will return the number of tuples processed through the quuee. */
+					/* Each pcxt will have one input and one output queue */
+					shm_mq_result res;
+					ereport(LOG, (errmsg("Total processed is \"%lu\"", total_processed)));
+					ereport(LOG, (errmsg("Main trying to send message to worker 1")));
+					ereport(LOG, (errmsg("Trying to get the sender")));
+					shm_mq_get_sender(outq);
+					ereport(LOG, (errmsg("We can get the sender")));
+					ereport(LOG, (errmsg("Sender pid is \"%d\"", shm_mq_get_sender(outq)->pid)));
+					res = shm_mq_send(output, sizeof(&num_tuples), &num_tuples, false);
+					if (res != SHM_MQ_SUCCESS)
+					{
+						ereport(LOG, (errmsg("Send was not successful")));
+					}
+					ereport(LOG, (errmsg("Send successful, main sent \"%d\" tuples", num_tuples)));
+
+					has_written = true;
+
+					/* Reset for next batch. */
+					num_tuples = 0;
+					tuples_size = 0;
+				}
+				else
+				{
+					tuples_size += tuple->t_len + HEAPTUPLESIZE;
+				}
+
+				if (!has_more_tuples)
+					break;
+
+				tuples[num_tuples++] = tuple;
 			}
 
-			shm_toc_insert(pcxt->toc, 6, tuple_space);
+			/* One final receive and send to every worker that there are no more tuples so they stop waiting. */
+			shm_mq_result res;
+			Size		nbytes;
+			void	   *data;
+			ereport(LOG, (errmsg("Main trying to receive response from worker.")));
+			res = shm_mq_receive(input, &nbytes, &data, false);
+			if (res == SHM_MQ_SUCCESS)
+			{
+				total_processed += *(int *)data;
+			}
+			else
+			{
+				ereport(LOG, (errmsg("Main worker receiving could not receive response from background worker.")));
+			}
+			ereport(LOG, (errmsg("Recieve successful, worker processed \"%d\" tuples, nbytes is \"%lu\"", *(int *)data, nbytes)));
 
-			/* Store num_tuples. */
-			num_tuples_space = shm_toc_allocate(pcxt->toc, sizeof(int));
-			memcpy(num_tuples_space, &num_tuples, sizeof(int));
-			shm_toc_insert(pcxt->toc, 7, num_tuples_space);
+			num_tuples = 0;
+			ereport(LOG, (errmsg("Main trying to send message to worker 2")));
+			ereport(LOG, (errmsg("Sender pid is \"%d\"", shm_mq_get_sender(outq)->pid)));
+			res = shm_mq_send(output, sizeof(&num_tuples), &num_tuples, false);
+			if (res != SHM_MQ_SUCCESS)
+			{
+				ereport(LOG, (errmsg("Send was not successful")));
+			}
+			ereport(LOG, (errmsg("Send successful, main sent \"%d\" tuples", num_tuples)));
+
+			WaitForParallelWorkersToFinish(pcxt);
 
 			pfree(values);
 			pfree(nulls);
 
-			LaunchParallelWorkers(pcxt);
-
-			WaitForParallelWorkersToFinish(pcxt);
+			shm_mq_detach(input);
+			shm_mq_detach(output);
 
 			DestroyParallelContext(pcxt);
 			ExitParallelMode();
+
+			*processed = total_processed;
 		}
 		else
 			*processed = CopyFrom(cstate);	/* copy from file to database */
@@ -2990,7 +3117,7 @@ CopyFrom(CopyState cstate)
 			 * t_tableOid before evaluating them.
 			 */
 			tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
-			ereport(LOG, (errmsg("tuple len is \"%d\"", tuple->t_len)));
+
 			/* Triggers and stuff need to be invoked in query context. */
 			if (!IsYBRelation(resultRelInfo->ri_RelationDesc))
 				MemoryContextSwitchTo(oldcontext);
@@ -3402,7 +3529,8 @@ static void CopyFromMain(CopyState cstate)
  * Copy FROM logic handled by background workers when using parallel copy.
  */
 static uint64 
-CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
+CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
+			   shm_mq_handle *input, shm_mq_handle *output)
 {
 	HeapTuple	tuple;
 	TupleDesc	tupDesc;
@@ -3436,7 +3564,7 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 	uint64		firstBufferedLineNo = 0;
 
 	Assert(cstate->rel);
-	ereport(LOG, (errmsg("Getting here 1")));
+
 	tupDesc = RelationGetDescr(cstate->rel);
 
 	/*----------
@@ -3498,7 +3626,7 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 		if (!XLogIsNeeded())
 			hi_options |= HEAP_INSERT_SKIP_WAL;
 	}
-	ereport(LOG, (errmsg("Getting here 2")));
+	ereport(LOG, (errmsg("Getting here 1")));
 	/*
 	 * Optimize if new relfilenode was created in this subxact or one of its
 	 * committed children and we won't see those rows later as part of an
@@ -3550,7 +3678,7 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 
 		hi_options |= HEAP_INSERT_FROZEN;
 	}
-	ereport(LOG, (errmsg("Getting here 3")));
+	ereport(LOG, (errmsg("Getting here 2")));
 	/*
 	 * We need a ResultRelInfo so we can use the regular executor's
 	 * index-entry-making machinery.  (There used to be a huge amount of code
@@ -3562,9 +3690,9 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 					  1,		/* dummy rangetable index */
 					  NULL,
 					  0);
-	ereport(LOG, (errmsg("Getting here 4")));
+	ereport(LOG, (errmsg("Getting here 3")));
 	ExecOpenIndices(resultRelInfo, false);
-	ereport(LOG, (errmsg("Getting here 5")));
+	ereport(LOG, (errmsg("Getting here 4")));
 	estate->es_result_relations = resultRelInfo;
 	estate->es_num_result_relations = 1;
 	estate->es_result_relation_info = resultRelInfo;
@@ -3574,7 +3702,7 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 	myslot = ExecInitExtraTupleSlot(estate, tupDesc);
 	/* Triggers might need a slot as well */
 	estate->es_trig_tuple_slot = ExecInitExtraTupleSlot(estate, NULL);
-	ereport(LOG, (errmsg("Getting here 6")));
+	ereport(LOG, (errmsg("Getting here 5")));
 	/*
 	 * Set up a ModifyTableState so we can let FDW(s) init themselves for
 	 * foreign-table result relation(s).
@@ -3589,10 +3717,10 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 		resultRelInfo->ri_FdwRoutine->BeginForeignInsert != NULL)
 		resultRelInfo->ri_FdwRoutine->BeginForeignInsert(mtstate,
 														 resultRelInfo);
-	ereport(LOG, (errmsg("Getting here 7")));
+	ereport(LOG, (errmsg("Getting here 6")));
 	/* Prepare to catch AFTER triggers. */
 	AfterTriggerBeginQuery();
-	ereport(LOG, (errmsg("Getting here 8")));
+	ereport(LOG, (errmsg("Getting here 7")));
 	/*
 	 * If there are any triggers with transition tables on the named relation,
 	 * we need to be prepared to capture transition tuples.
@@ -3601,7 +3729,7 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 		MakeTransitionCaptureState(cstate->rel->trigdesc,
 								   RelationGetRelid(cstate->rel),
 								   CMD_INSERT);
-	ereport(LOG, (errmsg("Getting here 9")));
+	ereport(LOG, (errmsg("Getting here 8")));
 	/*
 	 * If the named relation is a partitioned table, initialize state for
 	 * CopyFrom tuple routing.
@@ -3622,7 +3750,7 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 		if (cstate->transition_capture != NULL)
 			ExecSetupChildParentMapForLeaf(proute);
 	}
-	ereport(LOG, (errmsg("Getting here 10")));
+	ereport(LOG, (errmsg("Getting here 9")));
 	if (isBatchTxnCopy)
 	{
 		/*
@@ -3654,7 +3782,7 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 		}
 		cstate->batch_size = batch_size;
 	}
-	ereport(LOG, (errmsg("Getting here 11")));
+	ereport(LOG, (errmsg("Getting here 10")));
 	/*
 	 * It's more efficient to prepare a bunch of tuples for insertion, and
 	 * insert them in one heap_multi_insert() call, than call heap_insert()
@@ -3678,14 +3806,14 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 	{
 		useMultiInsert = true;
 	}
-	ereport(LOG, (errmsg("Getting here 12")));
+	ereport(LOG, (errmsg("Getting here 11")));
 	useYBMultiInsert = useMultiInsert && IsYBRelation(resultRelInfo->ri_RelationDesc);
 	useHeapMultiInsert = useMultiInsert && !IsYBRelation(resultRelInfo->ri_RelationDesc);
 	if (useHeapMultiInsert)
 	{
 		bufferedTuples = palloc(MAX_BUFFERED_TUPLES * sizeof(HeapTuple));
 	}
-	ereport(LOG, (errmsg("Getting here 13")));
+	ereport(LOG, (errmsg("Getting here 12")));
 	/*
 	 * Only use non-txn insert if it's explicitly enabled, the relation meets criteria for
 	 * multi insert (e.g. no triggers), and the relation does not have secondary indices.
@@ -3700,7 +3828,7 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 	{
 		useNonTxnInsert = false;
 	}
-	ereport(LOG, (errmsg("Getting here 14")));
+	ereport(LOG, (errmsg("Getting here 13")));
 	/*
 	 * Check BEFORE STATEMENT insertion triggers. It's debatable whether we
 	 * should do this for COPY, since it's not really an "INSERT" statement as
@@ -3708,18 +3836,22 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 	 * EACH ROW triggers that we already fire on COPY.
 	 */
 	ExecBSInsertTriggers(estate, resultRelInfo);
-	ereport(LOG, (errmsg("Getting here 15")));
+	ereport(LOG, (errmsg("Getting here 14")));
 	values = (Datum *) palloc(tupDesc->natts * sizeof(Datum));
 	nulls = (bool *) palloc(tupDesc->natts * sizeof(bool));
-	ereport(LOG, (errmsg("Getting here 16")));
+	ereport(LOG, (errmsg("Getting here 15")));
 	bistate = GetBulkInsertState();
-	ereport(LOG, (errmsg("Getting here 17")));
+	ereport(LOG, (errmsg("Getting here 16")));
 	/* Set up callback to identify error line number */
 	errcallback.callback = CopyFromErrorCallback;
+	ereport(LOG, (errmsg("Getting here 16.1")));
 	errcallback.arg = (void *) cstate;
+	ereport(LOG, (errmsg("Getting here 16.2")));
 	errcallback.previous = error_context_stack;
+	ereport(LOG, (errmsg("Getting here 16.3")));
+	ereport(LOG, (errmsg("errcallback address is \"%p\"", &errcallback)));
 	error_context_stack = &errcallback;
-	ereport(LOG, (errmsg("Getting here 18")));
+	ereport(LOG, (errmsg("Getting here 17")));
 	/* Warn if non-txn COPY enabled and relation does not meet non-txn criteria. */
 	if (YBIsNonTxnCopyEnabled() && !useNonTxnInsert)
 		ereport(WARNING,
@@ -3729,8 +3861,9 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 				 errhint("Non-transactional COPY is not supported on relations with "
 						 "secondary indices or triggers.")));
 	ereport(LOG, (errmsg("Getting here 19")));
-	HeapTuple tuple_space = shm_toc_lookup(toc, 6, false);
-	int num_tuples_sent = *(int *)shm_toc_lookup(toc, 7, false);
+	HeapTuple tuple_space;
+	HeapTuple curtuple_address;
+	int num_tuples_sent = 0;
 	int num_tuples_retrieved = 0;
 	bool has_more_tuples = true;
 	ereport(LOG, (errmsg("Getting here 20")));
@@ -3762,15 +3895,52 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc)
 			/* Switch into its memory context */
 			if (!IsYBRelation(resultRelInfo->ri_RelationDesc))
 				MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-			ereport(LOG, (errmsg("Getting here 21")));
-			has_more_tuples = num_tuples_retrieved < num_tuples_sent;
+
+			if (num_tuples_retrieved >= num_tuples_sent)
+			{
+				shm_mq_result res;
+				Size nbytes;
+				void *data;
+
+				/* We've processed all our shared tuples, send our response to Main process. */
+				if (num_tuples_sent > 0)
+				{
+					ereport(LOG, (errmsg("Worker trying to send response to main.")));
+					res = shm_mq_send(output, sizeof(&processed), &processed, false);
+					if (res != SHM_MQ_SUCCESS)
+					{
+						ereport(LOG, (errmsg("Worker couldn't send response to main.")));
+					}
+					ereport(LOG, (errmsg("Send successful, worker processed \"%lu\" tuples", processed)));
+
+					processed = 0;
+				}
+
+				/* Try to get some more tuples. */
+				ereport(LOG, (errmsg("Worker trying to receive message from main.")));
+				res = shm_mq_receive(input, &nbytes, &data, false);
+				if (res != SHM_MQ_SUCCESS)
+				{
+					ereport(LOG, (errmsg("Worker couldn't receive message from main.")));
+				}
+				ereport(LOG, (errmsg("Receive successful, worker recieved \"%d\" tuples", *(int *) data)));
+
+				tuple_space = (HeapTuple) ((char *) shm_toc_lookup(toc, 8, false));
+				num_tuples_sent = *(int *) data;
+				has_more_tuples = num_tuples_sent != 0;
+				num_tuples_retrieved = 0;
+				curtuple_address = tuple_space;
+			}
+
 			if (!has_more_tuples)
 				break;
 			
-			tuple = tuple_space;
-			tuple_space += HEAPTUPLESIZE + tuple->t_len;
+			tuple = curtuple_address;
+			tuple->t_data = (HeapTupleHeader) ((char*) tuple + HEAPTUPLESIZE);
+
+			curtuple_address = (HeapTuple) ((char *) curtuple_address + HEAPTUPLESIZE + tuple->t_len);
 			num_tuples_retrieved++;
-			ereport(LOG, (errmsg("Getting here 22")));
+
 			/* Triggers and stuff need to be invoked in query context. */
 			if (!IsYBRelation(resultRelInfo->ri_RelationDesc))
 				MemoryContextSwitchTo(oldcontext);
@@ -4132,8 +4302,11 @@ void ParallelCopyMain(dsm_segment *seg, shm_toc *toc)
 	char *rangetable_space;
 	List *range_table;
 	CopyState cstate;
+	shm_mq *inq;
+	shm_mq *outq;
+	shm_mq_handle *input;
+	shm_mq_handle *output;
 
-	ereport(LOG, (errmsg("Main 1")));
 	/* Retrieving data from shared memory. */
 	relationForm = shm_toc_lookup(toc, 0, false);
 	tupDesc = shm_toc_lookup(toc, 1, false);
@@ -4144,7 +4317,15 @@ void ParallelCopyMain(dsm_segment *seg, shm_toc *toc)
 	range_table = (List *) rangetable_space;
 	cstate = shm_toc_lookup(toc, 5, false);
 
-	ereport(LOG, (errmsg("Main 2")));
+	/* Attach to message queues. */
+	outq = (shm_mq *) shm_toc_lookup(toc, 6, false);
+	shm_mq_set_sender(outq, MyProc);
+	output = shm_mq_attach(outq, seg, NULL);
+
+	inq = shm_toc_lookup(toc, 7, false);
+	shm_mq_set_receiver(inq, MyProc);
+	input = shm_mq_attach(inq, seg, NULL);
+
 	/* Setting fields. */
 	rel->rd_rel = relationForm;
 	rel->rd_att = tupDesc;
@@ -4152,26 +4333,16 @@ void ParallelCopyMain(dsm_segment *seg, shm_toc *toc)
 	cstate->attnumlist = attnumlist;
 	cstate->range_table = range_table;
 
-	ereport(LOG, (errmsg("Num atts of cstate in parallelcopymain is \"%d\"", RelationGetNumberOfAttributes(cstate->rel))));
-	ereport(LOG, (errmsg("Main 3")));
+	/* 
+	 * COPY shouldn't need to worry about invalidating caches, since we expect the table we are
+	 * writing to already exist before the COPY FROM command is called.
+	 */
+	yb_catalog_cache_version = YbGetMasterCatalogVersion();
 
-	/* To prevent MISSING/NULL primary key value error. */
-	sleep(3);
-	// HeapTuple tuple = shm_toc_lookup(toc, 6, false);
-	// int num_retries = 0;
-	// int MAX_RETRIES = 100;
-	// while (tuple->t_len == 0 && num_retries++ < MAX_RETRIES)
-	// {
-	// 	tuple = shm_toc_lookup(toc, 6, false);
-	// }
+	CopyFromWorker(cstate, seg, toc, input, output);
 
-	// if (num_retries >= MAX_RETRIES)
-	// {
-	// 	ereport(ERROR, (errmsg("Couldn't load tuples properly, try waiting longer after table creation")));
-	// 	return;
-	// }
-
-	CopyFromWorker(cstate, seg, toc);
+	shm_mq_detach(input);
+	shm_mq_detach(output);
 }
 
 /*
