@@ -845,6 +845,18 @@ CopyLoadRawBuf(CopyState cstate)
 	return (inbytes > 0);
 }
 
+struct shm_mq
+{
+	slock_t		mq_mutex;
+	PGPROC	   *mq_receiver;
+	PGPROC	   *mq_sender;
+	pg_atomic_uint64 mq_bytes_read;
+	pg_atomic_uint64 mq_bytes_written;
+	Size		mq_ring_size;
+	bool		mq_detached;
+	uint8		mq_ring_offset;
+	char		mq_ring[FLEXIBLE_ARRAY_MEMBER];
+};
 
 /*
  *	 DoCopy executes the SQL COPY statement
@@ -3568,7 +3580,12 @@ CopyFrom(CopyState cstate)
 							}
 							else
 							{
+								struct timespec begin, end;
+								clock_gettime(CLOCK_MONOTONIC_RAW, &begin);
 								YBCExecuteInsert(resultRelInfo->ri_RelationDesc, tupDesc, tuple);
+								clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+								uint64_t time_elapsed = (end.tv_nsec - begin.tv_nsec) / 1000.0 + (end.tv_sec - begin.tv_sec) * 1000000.0;
+								ereport(LOG, (errmsg("*** microseconds spent in Commit and Initialize is \"%llu\"", time_elapsed)));
 							}
 						}
 						else if (resultRelInfo->ri_FdwRoutine != NULL)
@@ -4394,7 +4411,12 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
 							}
 							else
 							{
+								// struct timespec begin, end;
+								// clock_gettime(CLOCK_MONOTONIC_RAW, &begin);
 								YBCExecuteInsert(resultRelInfo->ri_RelationDesc, tupDesc, tuple);
+								// clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+								// uint64_t time_elapsed = (end.tv_nsec - begin.tv_nsec) / 1000.0 + (end.tv_sec - begin.tv_sec) * 1000000.0;
+								// ereport(LOG, (errmsg("microseconds spent in executeInsert is \"%llu\"", time_elapsed)));
 							}
 						}
 						else if (resultRelInfo->ri_FdwRoutine != NULL)
@@ -4469,8 +4491,13 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
 		 */
 		if (isBatchTxnCopy)
 		{
+			// struct timespec begin, end;
+			// clock_gettime(CLOCK_MONOTONIC_RAW, &begin);
 			YBCCommitTransaction();
 			YBInitializeTransaction();
+			// clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+			// uint64_t time_elapsed = (end.tv_nsec - begin.tv_nsec) / 1000.0 + (end.tv_sec - begin.tv_sec) * 1000000.0;
+			// ereport(LOG, (errmsg("*** microseconds spent in Commit and Initialize is \"%llu\"", time_elapsed)));
 		}
 	}
 
