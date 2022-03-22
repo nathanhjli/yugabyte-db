@@ -774,18 +774,6 @@ CopyLoadRawBuf(CopyState cstate)
 	return (inbytes > 0);
 }
 
-struct shm_mq
-{
-	slock_t		mq_mutex;
-	PGPROC	   *mq_receiver;
-	PGPROC	   *mq_sender;
-	pg_atomic_uint64 mq_bytes_read;
-	pg_atomic_uint64 mq_bytes_written;
-	Size		mq_ring_size;
-	bool		mq_detached;
-	uint8		mq_ring_offset;
-	char		mq_ring[FLEXIBLE_ARRAY_MEMBER];
-};
 
 /*
  *	 DoCopy executes the SQL COPY statement
@@ -1034,9 +1022,6 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 
 			Size tuplespace_size = (Size) cstate->shared_memory_size;
 
-			// ereport(LOG, (errmsg("catalog version in main process is \"%llu\"", yb_catalog_cache_version)));
-			// ereport(LOG, (errmsg("master catalog version in main process is \"%llu\"", YbGetMasterCatalogVersion())));
-
 			for (int worker_num = 0; worker_num < cstate->num_workers; worker_num++) {
 				ParallelContext *pcxt;
 				Form_pg_class relform_space;
@@ -1188,6 +1173,7 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 					{
 						break;
 					}
+					/* Need to add handle for if workers failed to start. */
 				}
 
 				pcxts[worker_num] = pcxt;
@@ -1213,7 +1199,9 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			int num_tuples = 0;
 
 			/*
-			 * Currently, we will just iterate through workers, 
+			 * Currently, we will just iterate through workers.
+			 * When hash code partitioning is added, we will set cur_worker_num based on the
+			 * calculated hash code for the tuple.
 			 */
 			Size tuples_size = 0;
 			bool has_written[cstate->num_workers];
@@ -4184,12 +4172,7 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
 							}
 							else
 							{
-								// struct timespec begin, end;
-								// clock_gettime(CLOCK_MONOTONIC_RAW, &begin);
 								YBCExecuteInsert(resultRelInfo->ri_RelationDesc, tupDesc, tuple);
-								// clock_gettime(CLOCK_MONOTONIC_RAW, &end);
-								// uint64_t time_elapsed = (end.tv_nsec - begin.tv_nsec) / 1000.0 + (end.tv_sec - begin.tv_sec) * 1000000.0;
-								// ereport(LOG, (errmsg("microseconds spent in executeInsert is \"%llu\"", time_elapsed)));
 							}
 						}
 						else if (resultRelInfo->ri_FdwRoutine != NULL)
@@ -4264,13 +4247,8 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
 		 */
 		if (isBatchTxnCopy)
 		{
-			// struct timespec begin, end;
-			// clock_gettime(CLOCK_MONOTONIC_RAW, &begin);
 			YBCCommitTransaction();
 			YBInitializeTransaction();
-			// clock_gettime(CLOCK_MONOTONIC_RAW, &end);
-			// uint64_t time_elapsed = (end.tv_nsec - begin.tv_nsec) / 1000.0 + (end.tv_sec - begin.tv_sec) * 1000000.0;
-			// ereport(LOG, (errmsg("*** microseconds spent in Commit and Initialize is \"%llu\"", time_elapsed)));
 		}
 	}
 

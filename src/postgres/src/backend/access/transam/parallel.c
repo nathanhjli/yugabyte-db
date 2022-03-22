@@ -1282,7 +1282,7 @@ ParallelWorkerMain(Datum main_arg)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("invalid magic number in dynamic shared memory segment")));
-	
+
 	/* Look up fixed parallel state. */
 	fps = shm_toc_lookup(toc, PARALLEL_KEY_FIXED, false);
 	MyFixedParallelState = fps;
@@ -1291,7 +1291,7 @@ ParallelWorkerMain(Datum main_arg)
 	ParallelMasterPid = fps->parallel_master_pid;
 	ParallelMasterBackendId = fps->parallel_master_backend_id;
 	on_shmem_exit(ParallelWorkerShutdown, (Datum) 0);
-	
+
 	/*
 	 * Now we can find and attach to the error queue provided for us.  That's
 	 * good, because until we do that, any errors that happen here will not be
@@ -1306,7 +1306,7 @@ ParallelWorkerMain(Datum main_arg)
 	pq_redirect_to_shm_mq(seg, mqh);
 	pq_set_parallel_master(fps->parallel_master_pid,
 						   fps->parallel_master_backend_id);
-	
+
 	/*
 	 * Send a BackendKeyData message to the process that initiated parallelism
 	 * so that it has access to our PID before it receives any other messages
@@ -1318,7 +1318,7 @@ ParallelWorkerMain(Datum main_arg)
 	pq_sendint32(&msgbuf, (int32) MyProcPid);
 	pq_sendint32(&msgbuf, (int32) MyCancelKey);
 	pq_endmessage(&msgbuf);
-	
+
 	/*
 	 * Hooray! Primary initialization is complete.  Now, we need to set up our
 	 * backend-local state to match the original backend.
@@ -1336,14 +1336,14 @@ ParallelWorkerMain(Datum main_arg)
 	if (!BecomeLockGroupMember(fps->parallel_master_pgproc,
 							   fps->parallel_master_pid))
 		return;
-	
+
 	/*
 	 * Restore transaction and statement start-time timestamps.  This must
 	 * happen before anything that would start a transaction, else asserts in
 	 * xact.c will fire.
 	 */
 	SetParallelStartTimestamps(fps->xact_ts, fps->stmt_ts);
-	
+
 	/*
 	 * Identify the entry point to be called.  In theory this could result in
 	 * loading an additional library, though most likely the entry point is in
@@ -1354,12 +1354,12 @@ ParallelWorkerMain(Datum main_arg)
 	function_name = entrypointstate + strlen(library_name) + 1;
 
 	entrypt = LookupParallelWorkerFunction(library_name, function_name);
-	
+
 	/* Restore database connection. */
 	BackgroundWorkerInitializeConnectionByOid(fps->database_id,
 											  fps->authenticated_user_id,
 											  0);
-	
+
 	/*
 	 * Set the client encoding to the database encoding, since that is what
 	 * the leader will expect.
@@ -1432,7 +1432,7 @@ ParallelWorkerMain(Datum main_arg)
 	/* Restore temp-namespace state to ensure search path matches leader's. */
 	SetTempNamespaceState(fps->temp_namespace_id,
 						  fps->temp_toast_namespace_id);
-	
+
 	/* Restore reindex state. */
 	reindexspace = shm_toc_lookup(toc, PARALLEL_KEY_REINDEX_STATE, false);
 	RestoreReindexState(reindexspace);
@@ -1443,17 +1443,17 @@ ParallelWorkerMain(Datum main_arg)
 	 */
 	InitializingParallelWorker = false;
 	EnterParallelMode();
-	
+
 	/* Restore enum blacklist. */
 	enumblacklistspace = shm_toc_lookup(toc, PARALLEL_KEY_ENUMBLACKLIST,
 										false);
 	RestoreEnumBlacklist(enumblacklistspace);
-	
+
 	/*
 	 * Time to do the real work: invoke the caller-supplied code.
 	 */
 	entrypt(seg, toc);
-	
+
 	/* Must exit parallel mode to pop active snapshot. */
 	ExitParallelMode();
 

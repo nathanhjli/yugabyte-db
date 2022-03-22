@@ -1629,8 +1629,6 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
           server_->get_ysql_catalog_version(nullptr /* current_version */,
                                             &last_breaking_catalog_version);
         }
-        LOG(ERROR) << "tablet_service ysql catalog version is " << std::to_string(pg_req.ysql_catalog_version());
-        LOG(ERROR) << "tablet_service last_breaking_catalog_version is " << std::to_string(last_breaking_catalog_version);
         if (pg_req.ysql_catalog_version() < last_breaking_catalog_version) {
           SetupErrorAndRespond(resp->mutable_error(),
               STATUS_SUBSTITUTE(QLError, "The catalog snapshot used for this "
