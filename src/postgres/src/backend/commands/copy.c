@@ -1245,7 +1245,6 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 						shm_mq_result res;
 						Size		nbytes;
 						void	   *data;
-						ereport(LOG, (errmsg("Main trying to receive response from worker \"%d\".", cur_worker_num)));
 						res = shm_mq_receive(inputs[cur_worker_num], &nbytes, &data, false);
 						if (res == SHM_MQ_SUCCESS)
 						{
@@ -1254,7 +1253,7 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 						}
 						else
 						{
-							ereport(ERROR, (errmsg("Main worker receiving could not receive response from background worker \"%d\".", cur_worker_num)));
+							ereport(ERROR, (errmsg("Main worker could not receive response from background worker \"%d\".", cur_worker_num)));
 						}
 					}
 
@@ -1273,7 +1272,6 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 					/* Each pcxt will have one input and one output queue */
 					shm_mq_result res;
 					res = shm_mq_send(outputs[cur_worker_num], sizeof(&num_tuples), &num_tuples, false);
-					ereport(LOG, (errmsg("Main trying to send to worker \"%d\".", cur_worker_num)));
 					if (res != SHM_MQ_SUCCESS)
 					{
 						ereport(LOG, (errmsg("Send was not successful to worker \"%d\".", cur_worker_num)));
@@ -1288,7 +1286,9 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 					
 					/* Worker numbers will go from 0 to cstate->num_workers - 1. */
 					/* Possibly need to consider case where workers fail to launch. */
-					cur_worker_num = cur_worker_num + 1 ? cur_worker_num + 1 < cstate->num_workers : 0;
+					cur_worker_num = cur_worker_num + 1 < cstate->num_workers
+						? cur_worker_num + 1
+						: 0;
 
 					ereport(LOG, (errmsg("Total processed is \"%lu\"", total_processed)));
 				}
@@ -1305,9 +1305,7 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 				shm_mq_result res;
 				Size		nbytes;
 				void	   *data;
-				ereport(LOG, (errmsg("worker num is \"%d\", has_written is \"%d\"", worker_num, has_written[worker_num])));
 				if (has_written[worker_num]) {
-					ereport(LOG, (errmsg("Main trying to receive response from worker \"%d\".", worker_num)));
 					res = shm_mq_receive(inputs[worker_num], &nbytes, &data, false);
 					if (res == SHM_MQ_SUCCESS)
 					{
@@ -1321,7 +1319,6 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 				}
 
 				num_tuples = 0;
-				ereport(LOG, (errmsg("Main trying to send final message to worker \"%d\"", worker_num)));
 				res = shm_mq_send(outputs[worker_num], sizeof(&num_tuples), &num_tuples, false);
 				if (res != SHM_MQ_SUCCESS)
 				{
@@ -1402,7 +1399,7 @@ ProcessCopyOptions(ParseState *pstate,
 
 	cstate->num_workers = 0;
 
-	cstate->shared_memory_size = 10000000; /* 10 MB */
+	cstate->shared_memory_size = 1000000; /* 1 MB */
 
 	/* Extract options from the statement node tree */
 	foreach(option, options)
@@ -3371,12 +3368,7 @@ CopyFrom(CopyState cstate)
 							}
 							else
 							{
-								struct timespec begin, end;
-								clock_gettime(CLOCK_MONOTONIC_RAW, &begin);
 								YBCExecuteInsert(resultRelInfo->ri_RelationDesc, tupDesc, tuple);
-								clock_gettime(CLOCK_MONOTONIC_RAW, &end);
-								uint64_t time_elapsed = (end.tv_nsec - begin.tv_nsec) / 1000.0 + (end.tv_sec - begin.tv_sec) * 1000000.0;
-								ereport(LOG, (errmsg("*** microseconds spent in Commit and Initialize is \"%llu\"", time_elapsed)));
 							}
 						}
 						else if (resultRelInfo->ri_FdwRoutine != NULL)
@@ -3451,13 +3443,8 @@ CopyFrom(CopyState cstate)
 		 */
 		if (isBatchTxnCopy)
 		{
-			struct timespec begin, end;
-			clock_gettime(CLOCK_MONOTONIC_RAW, &begin);
 			YBCCommitTransaction();
 			YBInitializeTransaction();
-			clock_gettime(CLOCK_MONOTONIC_RAW, &end);
-			uint64_t time_elapsed = (end.tv_nsec - begin.tv_nsec) / 1000.0 + (end.tv_sec - begin.tv_sec) * 1000000.0;
-			ereport(LOG, (errmsg("*** microseconds spent in Commit and Initialize is \"%llu\"", time_elapsed)));
 		}
 	}
 
@@ -3956,7 +3943,6 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
 				/* We've processed all our shared tuples, send our response to Main process. */
 				if (num_tuples_sent > 0)
 				{
-					ereport(LOG, (errmsg("Worker trying to send response to main.")));
 					res = shm_mq_send(output, sizeof(&processed), &processed, false);
 					if (res != SHM_MQ_SUCCESS)
 					{
@@ -3968,7 +3954,6 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
 				}
 
 				/* Try to get some more tuples. */
-				ereport(LOG, (errmsg("Worker trying to receive message from main.")));
 				res = shm_mq_receive(input, &nbytes, &data, false);
 				if (res != SHM_MQ_SUCCESS)
 				{
@@ -4392,13 +4377,20 @@ void ParallelCopyMain(dsm_segment *seg, shm_toc *toc)
 	cstate->attnumlist = attnumlist;
 	cstate->range_table = range_table;
 
-	/* 
+	/*
+	 * InvalidateSystemCaches resets catalog version when starting up the background worker.
 	 * COPY shouldn't need to worry about invalidating caches, since we expect the table we are
 	 * writing to already exist before the COPY FROM command is called.
 	 */
 	yb_catalog_cache_version = YbGetMasterCatalogVersion();
 
+	/* Background workers don't have buffering enabled initially, so enable it. */
+	YBBeginOperationsBuffering();
+
 	CopyFromWorker(cstate, seg, toc, input, output);
+
+	/* Just in case. */
+	YBEndOperationsBuffering();
 
 	shm_mq_detach(input);
 	shm_mq_detach(output);
