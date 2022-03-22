@@ -3580,12 +3580,7 @@ CopyFrom(CopyState cstate)
 							}
 							else
 							{
-								struct timespec begin, end;
-								clock_gettime(CLOCK_MONOTONIC_RAW, &begin);
 								YBCExecuteInsert(resultRelInfo->ri_RelationDesc, tupDesc, tuple);
-								clock_gettime(CLOCK_MONOTONIC_RAW, &end);
-								uint64_t time_elapsed = (end.tv_nsec - begin.tv_nsec) / 1000.0 + (end.tv_sec - begin.tv_sec) * 1000000.0;
-								ereport(LOG, (errmsg("*** microseconds spent in Commit and Initialize is \"%llu\"", time_elapsed)));
 							}
 						}
 						else if (resultRelInfo->ri_FdwRoutine != NULL)
