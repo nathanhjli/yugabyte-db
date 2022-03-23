@@ -22,6 +22,8 @@
 
 #define DEFAULT_BATCH_ROWS_PER_TRANSACTION  1000
 #define PARALLEL_KEY_TRANSACTION_STATE		UINT64CONST(0xFFFFFFFFFFFF0008)
+#define MIN_HASH_CODE						0
+#define MAX_HASH_CODE						65536
 
 /* CopyStateData is private in commands/copy.c */
 typedef struct CopyStateData *CopyState;
