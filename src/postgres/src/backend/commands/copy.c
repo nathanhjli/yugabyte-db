@@ -302,8 +302,6 @@ static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
 int yb_default_copy_from_rows_per_transaction = DEFAULT_BATCH_ROWS_PER_TRANSACTION;
 
 /* non-export function prototypes */
-static uint16 GetTupleHashCode(ListCell *cur, List *hashColumns, TupleDesc tupDesc,
-							   Datum *values, bool *nulls);
 static CopyState BeginCopy(ParseState *pstate, bool is_from, Relation rel,
 		  RawStmt *raw_query, Oid queryRelId, List *attnamelist,
 		  List *options);
@@ -317,9 +315,6 @@ static uint64 DoCopyTo(CopyState cstate);
 static uint64 CopyTo(CopyState cstate);
 static void CopyOneRowTo(CopyState cstate, Oid tupleOid,
 			 Datum *values, bool *nulls);
-static void CopyFromMain(CopyState cstate);
-static uint64 CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
-							 shm_mq_handle *input, shm_mq_handle *output);
 static void CopyFromInsertBatch(CopyState cstate, EState *estate,
 					CommandId mycid, int hi_options,
 					ResultRelInfo *resultRelInfo, TupleTableSlot *myslot,
@@ -341,6 +336,23 @@ static List *CopyGetAttnums(TupleDesc tupDesc, Relation rel,
 			   List *attnamelist);
 static char *limit_printout_length(const char *str);
 
+/* Parallel copy functions. */
+static uint64 ParallelCopyFrom(CopyState cstate);
+static void CopyFromMain(CopyState cstate);
+static uint64 CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
+							 shm_mq_handle *input, shm_mq_handle *output);
+static int SetupParallelCopyFrom(CopyState cstate, ParallelContext *pcxts[],
+								 shm_mq_handle *inputs[], shm_mq_handle *outputs[],
+								 HeapTuple tuple_spaces[], bool worker_ready[]);
+static List* GetHashColumns(CopyState cstate);
+static uint16 GetTupleHashCode(CopyState cstate, List *hashColumns, Datum *values, bool *nulls);
+static uint64 SendTuplesToWorker(HeapTuple **tuples, HeapTuple tuple_spaces[],
+								 shm_mq_handle *inputs[], shm_mq_handle *outputs[],
+								 bool has_written[], int worker_num, int num_tuples);
+static void EndParallelCopyFrom(CopyState cstate, ParallelContext *pcxts[],
+								shm_mq_handle *inputs[], shm_mq_handle *outputs[],
+								bool worker_ready[]);
+
 /* Low-level communications functions */
 static void SendCopyBegin(CopyState cstate);
 static void ReceiveCopyBegin(CopyState cstate);
@@ -356,74 +368,6 @@ static bool CopyGetInt32(CopyState cstate, int32 *val);
 static void CopySendInt16(CopyState cstate, int16 val);
 static bool CopyGetInt16(CopyState cstate, int16 *val);
 
-
-/*
- * Get hash code given tuple values and nulls.
- */
-static uint16
-GetTupleHashCode(ListCell *cur, List *hashColumns, TupleDesc tupDesc, Datum *values, bool *nulls)
-{
-	char *arg_buf;
-	size_t size = 0;
-
-	foreach(cur, hashColumns)
-	{
-			int index = lfirst_int(cur);
-			Oid argtype = TupleDescAttr(tupDesc, index)->atttypid;
-			if (unlikely(argtype == UNKNOWNOID))
-			{
-					ereport(ERROR,
-							(errcode(ERRCODE_INDETERMINATE_DATATYPE),
-							errmsg("undefined datatype given to yb_hash_code")));
-			}
-
-			size_t typesize;
-			const YBCPgTypeEntity *typeentity =
-							YbDataTypeFromOidMod(InvalidAttrNumber, argtype);
-			YBCStatus status = YBCGetDocDBKeySize(values[index], typeentity,
-							nulls[index], &typesize);
-			if (unlikely(!YBCStatusIsOK(status)))
-			{
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("Unsupported datatype given to yb_hash_code"),
-							errdetail("Only types supported by HASH key columns are allowed"),
-							errhint("Use explicit casts to ensure input types are as desired")));
-			}
-			size += typesize;
-	}
-
-	arg_buf = alloca(size);
-
-	char *arg_buf_pos = arg_buf;
-	size_t total_bytes = 0;
-
-	foreach(cur, hashColumns)
-	{
-			int index = lfirst_int(cur);
-			Oid argtype = TupleDescAttr(tupDesc, index)->atttypid;
-			const YBCPgTypeEntity *typeentity =
-							YbDataTypeFromOidMod(InvalidAttrNumber, argtype);
-			size_t written;
-			YBCStatus status = YBCAppendDatumToKey(values[index], typeentity,
-													nulls[index], arg_buf_pos, &written);
-			if (unlikely(!YBCStatusIsOK(status)))
-			{
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("Unsupported datatype given to yb_hash_code"),
-							errdetail("Only types supported by HASH key columns are allowed"),
-							errhint("Use explicit casts to ensure input types are as desired")));
-			}
-			arg_buf_pos += written;
-
-			total_bytes += written;
-	}
-
-	uint16_t hash_code = YBCCompoundHash(arg_buf, total_bytes);
-
-	return hash_code;
-}
 
 /*
  * Send copy start/stop messages for frontend copies.  These have changed
@@ -1094,462 +1038,11 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 							   NULL, stmt->attlist, stmt->options);
 		if (cstate->num_workers > 0)
 		{
-			/* Perform CopyFromMain so we can fail fast if needed. */
-			CopyFromMain(cstate);
-
-			ParallelContext *pcxts[cstate->num_workers];
-			shm_mq_handle *inputs[cstate->num_workers];
-			shm_mq_handle *outputs[cstate->num_workers];
-			HeapTuple tuple_spaces[cstate->num_workers];
-			uint64 total_processed = 0;
-
-			Size tuplespace_size = (Size) cstate->shared_memory_size;
-
-			int nworkers_ready = 0;
-			int first_ready_worker = -1;
-			bool worker_ready[cstate->num_workers];
-
-			EnterParallelMode();
-
-			for (int worker_num = 0; worker_num < cstate->num_workers; worker_num++) {
-				ParallelContext *pcxt;
-				Form_pg_class relform_space;
-				CopyState cstate_space;
-				Relation rel_space;
-				Size tupledesc_size = TupleDescSize(cstate->rel->rd_att);
-				TupleDesc tupledesc_space;
-				HeapTuple tuple_space;
-				char *attnumlist_data;
-				int attnumlist_len;
-				char *attnumlist_space;
-				char *rangetable_data;
-				int rangetable_len;
-				char *rangetable_space;
-				shm_mq *inq;
-				shm_mq *outq;
-				shm_mq_handle *input;
-				shm_mq_handle *output;
-				int queue_size = 1000;
-
-				/* Create a parallel context. */
-				pcxt = CreateParallelContext("postgres", "ParallelCopyMain", 1, false);
-
-				/* Estimate space for Form_pg_class, needed for Relation. */
-				shm_toc_estimate_chunk(&pcxt->estimator, CLASS_TUPLE_SIZE);
-				shm_toc_estimate_keys(&pcxt->estimator, 1);
-
-				/* Estimate space for TupleDesc, neded for Relation. */
-				shm_toc_estimate_chunk(&pcxt->estimator, tupledesc_size);
-				shm_toc_estimate_keys(&pcxt->estimator, 1);
-
-				/* Estimate space for Relation, needed for CopyState. */
-				shm_toc_estimate_chunk(&pcxt->estimator, sizeof(RelationData));
-				shm_toc_estimate_keys(&pcxt->estimator, 1);
-
-				/* Estimate space for attnumlist, needed for CopyState. */
-				attnumlist_data = nodeToString(cstate->attnumlist);
-				attnumlist_len = strlen(attnumlist_data) + 1;
-				shm_toc_estimate_chunk(&pcxt->estimator, attnumlist_len);
-				shm_toc_estimate_keys(&pcxt->estimator, 1);
-
-				/* Estimate space for range_table, needed for CopyState. */
-				rangetable_data = nodeToString(cstate->range_table);
-				rangetable_len = strlen(rangetable_data) + 1;
-				shm_toc_estimate_chunk(&pcxt->estimator, rangetable_len);
-				shm_toc_estimate_keys(&pcxt->estimator, 1);
-
-				/* Estimate space for CopyState. */
-				shm_toc_estimate_chunk(&pcxt->estimator, sizeof(CopyStateData));
-				shm_toc_estimate_keys(&pcxt->estimator, 1);
-
-				/* Estimate space for in queue. */
-				shm_toc_estimate_chunk(&pcxt->estimator, queue_size);
-				shm_toc_estimate_keys(&pcxt->estimator, 1);
-
-				/* Estimate space for out queue. */
-				shm_toc_estimate_chunk(&pcxt->estimator, queue_size);
-				shm_toc_estimate_keys(&pcxt->estimator, 1);
-
-				/* Estimate space for tuple. */
-				shm_toc_estimate_chunk(&pcxt->estimator, tuplespace_size);
-				shm_toc_estimate_keys(&pcxt->estimator, 1);
-
-				/* Everyone's had a chance to ask for space, so now create the DSM. */
-				InitializeParallelDSM(pcxt);
-
-				/* Store Form_pg_class rd_rel. */
-				relform_space = (FormData_pg_class *) 
-						shm_toc_allocate(pcxt->toc, CLASS_TUPLE_SIZE);
-				memcpy(relform_space, cstate->rel->rd_rel, CLASS_TUPLE_SIZE);
-				shm_toc_insert(pcxt->toc, 0, relform_space);
-
-				/* Store tuple desc. */
-				tupledesc_space = (TupleDesc)
-						shm_toc_allocate(pcxt->toc, tupledesc_size);
-				TupleDescCopy(tupledesc_space, cstate->rel->rd_att);
-				shm_toc_insert(pcxt->toc, 1, tupledesc_space);
-
-				/* Store Relation rel. */
-				rel_space = (RelationData *)
-					shm_toc_allocate(pcxt->toc, sizeof(RelationData));
-				/* rel_space->rd_rel is set in ParallelCopyMain. */
-				/* rel_space->rd_att is set in ParallelCopyMain. */
-				rel_space->rd_id = cstate->rel->rd_id;
-				rel_space->rd_refcnt = cstate->rel->rd_refcnt;
-				rel_space->rd_isnailed = cstate->rel->rd_isnailed;
-				rel_space->rd_createSubid = cstate->rel->rd_createSubid;
-				rel_space->rd_newRelfilenodeSubid = cstate->rel->rd_newRelfilenodeSubid;
-				rel_space->rd_indexvalid = cstate->rel->rd_indexvalid;
-				rel_space->rd_isvalid = cstate->rel->rd_isvalid;
-				rel_space->rd_oidindex = cstate->rel->rd_oidindex;
-				rel_space->rd_pkindex = cstate->rel->rd_pkindex;
-				rel_space->rd_replidindex = cstate->rel->rd_replidindex;
-				shm_toc_insert(pcxt->toc, 2, rel_space);
-				
-				/* Store List attnumlist. */
-				attnumlist_space = shm_toc_allocate(pcxt->toc, attnumlist_len);
-				memcpy(attnumlist_space, attnumlist_data, attnumlist_len);
-				shm_toc_insert(pcxt->toc, 3, attnumlist_space);
-
-				/* Store List range_table. */
-				rangetable_space = shm_toc_allocate(pcxt->toc, rangetable_len);
-				memcpy(rangetable_space, rangetable_data, rangetable_len);
-				shm_toc_insert(pcxt->toc, 4, rangetable_space);
-
-				/* Store CopyState, needed for CopyFromWorker. */
-				cstate_space = (CopyStateData *)
-						shm_toc_allocate(pcxt->toc, sizeof(CopyStateData));
-				/* cstate_space->rel is set in ParallelCopyMain. */
-				/* cstate->attnumlist is set in ParallelCopyMain. */
-				/* cstate->range_table is set in ParallelCopyMain. */
-				cstate_space->batch_size = cstate->batch_size;
-				cstate_space->freeze = cstate->freeze;
-				cstate_space->cur_relname = cstate->cur_relname;
-				cstate_space->cur_lineno = cstate->cur_lineno;
-				cstate_space->cur_attname = cstate->cur_attname;
-				cstate_space->cur_attval = cstate->cur_attval;
-				shm_toc_insert(pcxt->toc, 5, cstate_space);
-
-				/* Store inq. */
-				inq = shm_mq_create(shm_toc_allocate(pcxt->toc, queue_size), queue_size);
-				shm_toc_insert(pcxt->toc, 6, inq);
-				shm_mq_set_receiver(inq, MyProc);
-				input = shm_mq_attach(inq, pcxt->seg, NULL);
-				inputs[worker_num] = input;
-
-				/* Store outq. */
-				outq = shm_mq_create(shm_toc_allocate(pcxt->toc, queue_size), queue_size);
-				shm_toc_insert(pcxt->toc, 7, outq);
-				shm_mq_set_sender(outq, MyProc);
-				output = shm_mq_attach(outq, pcxt->seg, NULL);
-				outputs[worker_num] = output;
-
-				/* Store HeapTuples space. */
-				tuple_space = (HeapTuple) shm_toc_allocate(pcxt->toc, tuplespace_size);
-				shm_toc_insert(pcxt->toc, 8, tuple_space);
-				tuple_spaces[worker_num] = tuple_space;
-
-				ereport(LOG, (errmsg("Launching background workers")));
-				LaunchParallelWorkers(pcxt);
-
-				WaitForParallelWorkersToAttach(pcxt);
-
-				/* Even if it's not a proper worker, store it so we can destroy it later. */
-				pcxts[worker_num] = pcxt;
-
-				/* Track background workers that have successfully launched/attached. */
-				if (pcxt->nknown_attached_workers == 0) {
-					worker_ready[worker_num] = false;
-					continue;
-				}
-
-				ereport(LOG, (errmsg("Waiting for workers to attach to our queues.")));
-				/* Wait for workers to attach. */
-				for (;;)
-				{
-					CHECK_FOR_INTERRUPTS();
-					if (shm_mq_get_sender(inq) != NULL && shm_mq_get_receiver(outq) != NULL)
-					{
-						break;
-					}
-				}
-
-				worker_ready[worker_num] = true;
-				nworkers_ready++;
-
-				if (first_ready_worker < 0) {
-					first_ready_worker = worker_num;
-				}
-			}
-
-			/* If no workers launched, default back to regular copy. */
-			if (nworkers_ready == 0) {
-				elog(LOG,
-					"No background workers were launched successfully, "
-					"continuing with default copy.");
-				*processed = CopyFrom(cstate);
-				for (int i = 0; i < cstate->num_workers; i++) {
-					DestroyParallelContext(pcxts[i]);
-				}
-				ExitParallelMode();
-				EndCopyFrom(cstate);
-				return;
-			}
-
-			ereport(LOG, (errmsg("\"%d\" workers are ready, beginning tuple writing.", nworkers_ready)));
-
-			/* Write HeapTuples to shared memory space. */
-			EState *estate = CreateExecutorState();
-			ExprContext *econtext = GetPerTupleExprContext(estate);
-			Oid	loaded_oid = InvalidOid;
-			Datum *values = (Datum *) palloc(cstate->rel->rd_att->natts * sizeof(Datum));
-			bool *nulls = (bool *) palloc(cstate->rel->rd_att->natts * sizeof(bool));
-			bool has_more_tuples = true;
-
-			/*
-			 * Get columns associated with hash.
-			 */
-			Oid dboid = YBCGetDatabaseOid(cstate->rel);
-			YBCPgTableDesc ybc_table_desc = NULL;
-			TupleDesc tupDesc = RelationGetDescr(cstate->rel);
-
-			HandleYBStatus(YBCPgGetTableDesc(dboid, YbGetStorageRelid(cstate->rel), &ybc_table_desc));
-
-			List *attnums = cstate->attnumlist;
-			ListCell *cur;
-			List *hashColumns = NULL;
-
-			foreach(cur, attnums)
-			{
-				int attnum = lfirst_int(cur);
-				YBCPgColumnInfo column_info = {0};
-				HandleYBTableDescStatus(YBCPgGetColumnInfo(ybc_table_desc, attnum, &column_info),
-										ybc_table_desc);
-				if (column_info.is_hash)
-				{
-					hashColumns = lappend_int(hashColumns, attnum-1);
-				}
-			}
-
-			/* 
-			 * Estimating the maximum number of tuples we can possibly store.
-			 * Actual number of tuples will be smaller since we don't consider the header.
-			 */
-			int max_num_tuples = tuplespace_size / HEAPTUPLESIZE;
-			HeapTuple tuple;
-			HeapTuple tuples[nworkers_ready][max_num_tuples];
-			HeapTuple tuple_address;
-			int hash_range = MAX_HASH_CODE / nworkers_ready;
-
-			/*
-			 * Currently, we will just iterate through workers.
-			 * When hash code partitioning is added, we will set cur_worker_num based on the
-			 * calculated hash code for the tuple.
-			 */
-			Size tuples_size[nworkers_ready];
-			bool has_written[nworkers_ready];
-			int tuples_indexes[nworkers_ready];
-			for (int i = 0; i < nworkers_ready; i++)
-			{
-				has_written[i] = false;
-				tuples_indexes[i] = 0;
-				tuples_size[i] = 0;
-			}
-
-			/* Need to consider if some workers fail to launch. */
-			shm_mq_handle *ready_inputs[nworkers_ready];
-			shm_mq_handle *ready_outputs[nworkers_ready];
-			HeapTuple ready_tuple_spaces[nworkers_ready];
-			int j = 0;
-			for (int i = 0; i < cstate->num_workers; i++) {
-				if (worker_ready[i]) {
-					ready_inputs[j] = inputs[i];
-					ready_outputs[j] = outputs[i];
-					ready_tuple_spaces[j] = tuple_spaces[i];
-					j++;
-				}
-			}
-			int cur_worker_num = 0;
-
-			while (has_more_tuples)
-			{
-				CHECK_FOR_INTERRUPTS();
-
-				has_more_tuples = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
-				if (has_more_tuples)
-				{
-					/* Calculate the hash code for the tuple. */
-					uint16 hash_code = GetTupleHashCode(cur, hashColumns, tupDesc, values, nulls);
-
-					/* Determine which worker we should be writing to, given the hash code. */
-					cur_worker_num = (hash_code / hash_range) < nworkers_ready
-						? hash_code / hash_range
-						: nworkers_ready - 1;
-
-					tuple = heap_form_tuple(cstate->rel->rd_att, values, nulls);
-					if (loaded_oid != InvalidOid)
-						HeapTupleSetOid(tuple, loaded_oid);
-					tuple->t_tableOid = RelationGetRelid(cstate->rel);
-				}
-	
-				if (tuples_size[cur_worker_num] + tuple->t_len + HEAPTUPLESIZE > tuplespace_size)
-				{
-					/* 
-					 * If we've written to this worker before, we need to check the response before
-					 * sending the next batch.
-					 */
-					if (has_written[cur_worker_num])
-					{
-						shm_mq_result res;
-						Size		nbytes;
-						void	   *data;
-						res = shm_mq_receive(ready_inputs[cur_worker_num], &nbytes, &data, false);
-						if (res == SHM_MQ_SUCCESS)
-						{
-							total_processed += *(int *)data;
-							ereport(LOG, (errmsg("Recieve successful, worker \"%d\" processed \"%d\" tuples", cur_worker_num, *(int *)data)));
-						}
-						else
-						{
-							ereport(ERROR, (errmsg("Main worker could not receive response from background worker \"%d\".", cur_worker_num)));
-						}
-					}
-
-					/* If no more space, send the current batch of tuples to the worker. */
-					int num_tuples = tuples_indexes[cur_worker_num];
-					tuple_address = ready_tuple_spaces[cur_worker_num];
-					for (int tuple_num = 0; tuple_num < num_tuples; tuple_num++)
-					{
-						heap_copytuple_into_shm(tuples[cur_worker_num][tuple_num], tuple_address);
-						tuple_address = (HeapTuple) ((char *) tuple_address + HEAPTUPLESIZE + tuples[cur_worker_num][tuple_num]->t_len);
-						heap_freetuple(tuples[cur_worker_num][tuple_num]);
-					}
-
-					/* Signal to background worker that tuples are written. */
-					/* Main process will send number of tuples sent through the queue. */
-					/* Background worker will return the number of tuples processed through the quuee. */
-					/* Each pcxt will have one input and one output queue */
-					shm_mq_result res;
-					res = shm_mq_send(ready_outputs[cur_worker_num], sizeof(&num_tuples), &num_tuples, false);
-					if (res != SHM_MQ_SUCCESS)
-					{
-						ereport(LOG, (errmsg("Send was not successful to worker \"%d\".", cur_worker_num)));
-					}
-					ereport(LOG, (errmsg("Send successful, main sent \"%d\" tuple to worker \"%d\".", num_tuples, cur_worker_num)));
-
-					has_written[cur_worker_num] = true;
-
-					/* Reset for next batch. */
-					tuples_indexes[cur_worker_num] = 0;
-					tuples_size[cur_worker_num] = 0;
-				}
-
-				if (!has_more_tuples) {
-					/* No more tuples, we need to send all remaining stored tuples. */
-					for (int worker_num = 0; worker_num < nworkers_ready; worker_num++) {
-						if (tuples_indexes[worker_num] > 0) {
-							/* 
-							 * If we've written to this worker before, we need to check the response before
-							 * sending the next batch.
-							 */
-							if (has_written[worker_num])
-							{
-								shm_mq_result res;
-								Size		nbytes;
-								void	   *data;
-								res = shm_mq_receive(ready_inputs[worker_num], &nbytes, &data, false);
-								if (res == SHM_MQ_SUCCESS)
-								{
-									total_processed += *(int *)data;
-									ereport(LOG, (errmsg("Recieve successful, worker \"%d\" processed \"%d\" tuples", worker_num, *(int *)data)));
-								}
-								else
-								{
-									ereport(ERROR, (errmsg("Main worker could not receive response from background worker \"%d\".", worker_num)));
-								}
-							}
-
-							/* If no more space, send the current batch of tuples to the worker. */
-							int num_tuples = tuples_indexes[worker_num];
-							tuple_address = ready_tuple_spaces[worker_num];
-							for (int tuple_num = 0; tuple_num < num_tuples; tuple_num++)
-							{
-								heap_copytuple_into_shm(tuples[worker_num][tuple_num], tuple_address);
-								tuple_address = (HeapTuple) ((char *) tuple_address + HEAPTUPLESIZE + tuples[worker_num][tuple_num]->t_len);
-								heap_freetuple(tuples[worker_num][tuple_num]);
-							}
-
-							/* Signal to background worker that tuples are written. */
-							/* Main process will send number of tuples sent through the queue. */
-							/* Background worker will return the number of tuples processed through the quuee. */
-							/* Each pcxt will have one input and one output queue */
-							shm_mq_result res;
-							res = shm_mq_send(ready_outputs[worker_num], sizeof(&num_tuples), &num_tuples, false);
-							if (res != SHM_MQ_SUCCESS)
-							{
-								ereport(LOG, (errmsg("Send was not successful to worker \"%d\".", worker_num)));
-							}
-							ereport(LOG, (errmsg("Send successful, main sent \"%d\" tuple to worker \"%d\".", num_tuples, worker_num)));
-						}
-					}
-					break;
-				}
-
-				tuples[cur_worker_num][tuples_indexes[cur_worker_num]++] = tuple;
-				tuples_size[cur_worker_num] += tuple->t_len + HEAPTUPLESIZE;
-			}
-
-			/* One final receive and send to every worker that there are no more tuples so they stop waiting. */
-			for (int worker_num = 0; worker_num < nworkers_ready; worker_num++) {
-				shm_mq_result res;
-				Size		nbytes;
-				void	   *data;
-				if (has_written[worker_num])
-				{
-					res = shm_mq_receive(inputs[worker_num], &nbytes, &data, false);
-					if (res == SHM_MQ_SUCCESS)
-					{
-						total_processed += *(int *)data;
-					}
-					else
-					{
-						ereport(LOG, (errmsg("Main worker receiving could not receive response from background worker.")));
-					}
-					ereport(LOG, (errmsg("Recieve successful, worker \"%d\" processed \"%d\" tuples", worker_num, *(int *)data)));
-				}
-
-				int num_tuples = 0;
-				res = shm_mq_send(outputs[worker_num], sizeof(&num_tuples), &num_tuples, false);
-				if (res != SHM_MQ_SUCCESS)
-				{
-					ereport(LOG, (errmsg("Send was not successful")));
-				}
-				ereport(LOG, (errmsg("Send successful, main sent \"%d\" tuples", num_tuples)));
-			}
-
-			/* Cleanup. */
-			for (int worker_num = 0; worker_num < cstate->num_workers; worker_num++)
-			{
-				if (worker_ready[worker_num])
-				{
-					WaitForParallelWorkersToFinish(pcxts[worker_num]);
-
-					shm_mq_detach(inputs[worker_num]);
-					shm_mq_detach(outputs[worker_num]);
-				}
-
-				DestroyParallelContext(pcxts[worker_num]);
-			}
-
-			pfree(values);
-			pfree(nulls);
-
-			ExitParallelMode();
-
-			*processed = total_processed;
+			*processed = ParallelCopyFrom(cstate); /* perform parallel copy from */
 		}
-		else
+		else {
 			*processed = CopyFrom(cstate);	/* copy from file to database */
+		}
 		EndCopyFrom(cstate);
 	}
 	else
@@ -3730,9 +3223,168 @@ CopyFrom(CopyState cstate)
 }
 
 /*
+ * Perform PARALLEL COPY.
+ */
+static uint64
+ParallelCopyFrom(CopyState cstate) {
+	/* Perform CopyFromMain so we can fail fast if needed. */
+	CopyFromMain(cstate);
+
+	ParallelContext *pcxts[cstate->num_workers];
+	shm_mq_handle *inputs[cstate->num_workers];
+	shm_mq_handle *outputs[cstate->num_workers];
+	HeapTuple tuple_spaces[cstate->num_workers];
+	uint64 total_processed = 0;
+
+	Size tuplespace_size = (Size) cstate->shared_memory_size;
+
+	EnterParallelMode();
+
+	bool worker_ready[cstate->num_workers];
+	int nworkers_ready = SetupParallelCopyFrom(cstate, pcxts, inputs, outputs, tuple_spaces,
+											   worker_ready);
+
+	/* If no workers launched, default back to regular copy. */
+	if (nworkers_ready == 0) {
+		elog(LOG,
+			"No background workers were launched successfully, "
+			"continuing with default copy.");
+		total_processed = CopyFrom(cstate);
+		EndParallelCopyFrom(cstate, pcxts, inputs, outputs, worker_ready);
+		return total_processed;
+	}
+
+	ereport(LOG, (errmsg("\"%d\" workers are ready, beginning tuple writing.", nworkers_ready)));
+
+	/*
+	 * Get columns associated with hash.
+	 */
+	List *hashColumns = GetHashColumns(cstate);
+
+	/* 
+	 * Estimating the maximum number of tuples we can possibly store.
+	 * Actual number of tuples will be smaller since we don't consider the header.
+	 */
+	int max_num_tuples = tuplespace_size / HEAPTUPLESIZE;
+	HeapTuple tuple;
+	HeapTuple **tuples;
+
+	tuples = (HeapTuple **) palloc(nworkers_ready * sizeof(HeapTuple *));
+	for (int worker_num = 0; worker_num < nworkers_ready; worker_num++)
+	{
+		tuples[worker_num] = palloc(max_num_tuples * sizeof(HeapTuple));
+	}
+
+	int hash_range = MAX_HASH_CODE / nworkers_ready;
+	int cur_worker_num;
+
+	Size tuples_size[nworkers_ready];
+	bool has_written[nworkers_ready];
+	int tuples_indexes[nworkers_ready];
+	for (int worker_num = 0; worker_num < nworkers_ready; worker_num++)
+	{
+		has_written[worker_num] = false;
+		tuples_indexes[worker_num] = 0;
+		tuples_size[worker_num] = 0;
+	}
+
+	/* Need to consider if some workers fail to launch. */
+	shm_mq_handle *ready_inputs[nworkers_ready];
+	shm_mq_handle *ready_outputs[nworkers_ready];
+	HeapTuple ready_tuple_spaces[nworkers_ready];
+	int ready_worker_num = 0;
+	for (int worker_num = 0; worker_num < cstate->num_workers; worker_num++)
+	{
+		if (worker_ready[worker_num])
+		{
+			ready_inputs[ready_worker_num] = inputs[worker_num];
+			ready_outputs[ready_worker_num] = outputs[worker_num];
+			ready_tuple_spaces[ready_worker_num] = tuple_spaces[worker_num];
+			ready_worker_num++;
+		}
+	}
+
+	/* For reading and storing HeapTuples. */
+	EState *estate = CreateExecutorState();
+	ExprContext *econtext = GetPerTupleExprContext(estate);
+	Oid	loaded_oid = InvalidOid;
+	Datum *values = (Datum *) palloc(cstate->rel->rd_att->natts * sizeof(Datum));
+	bool *nulls = (bool *) palloc(cstate->rel->rd_att->natts * sizeof(bool));
+	bool has_more_tuples = true;
+
+	while (has_more_tuples)
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		has_more_tuples = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
+		if (has_more_tuples)
+		{
+			/* Calculate the hash code for the tuple. */
+			uint16 hash_code = GetTupleHashCode(cstate, hashColumns, values, nulls);
+
+			/* Determine which worker we should be writing to, given the hash code. */
+			cur_worker_num = (hash_code / hash_range) < nworkers_ready
+				? hash_code / hash_range
+				: nworkers_ready - 1;
+
+			tuple = heap_form_tuple(cstate->rel->rd_att, values, nulls);
+			if (loaded_oid != InvalidOid)
+				HeapTupleSetOid(tuple, loaded_oid);
+			tuple->t_tableOid = RelationGetRelid(cstate->rel);
+		}
+
+		if (tuples_size[cur_worker_num] + tuple->t_len + HEAPTUPLESIZE > tuplespace_size)
+		{
+			total_processed += SendTuplesToWorker(tuples, ready_tuple_spaces, ready_inputs,
+												  ready_outputs, has_written, cur_worker_num,
+												  tuples_indexes[cur_worker_num]);
+
+			/* Reset for next batch. */
+			tuples_indexes[cur_worker_num] = 0;
+			tuples_size[cur_worker_num] = 0;
+		}
+
+		if (!has_more_tuples) {
+			/* No more tuples, we need to send all remaining stored tuples. */
+			for (int worker_num = 0; worker_num < nworkers_ready; worker_num++) {
+				if (tuples_indexes[worker_num] > 0) {
+					total_processed += SendTuplesToWorker(tuples, ready_tuple_spaces, ready_inputs,
+														  ready_outputs, has_written, worker_num,
+														  tuples_indexes[worker_num]);
+				}
+			}
+			break;
+		}
+
+		tuples[cur_worker_num][tuples_indexes[cur_worker_num]++] = tuple;
+		tuples_size[cur_worker_num] += tuple->t_len + HEAPTUPLESIZE;
+	}
+
+	/* Final receive and send 0 tuples to all workers so they stop waiting. */
+	for (int worker_num = 0; worker_num < nworkers_ready; worker_num++) {
+		total_processed += SendTuplesToWorker(tuples, ready_tuple_spaces, ready_inputs,
+											  ready_outputs, has_written, worker_num, 0);
+	}
+
+	/* Cleanup. */
+	pfree(values);
+	pfree(nulls);
+	for (int worker_num = 0; worker_num < nworkers_ready; worker_num++)
+	{
+		pfree(tuples[worker_num]);
+	}
+	pfree(tuples);
+
+	EndParallelCopyFrom(cstate, pcxts, inputs, outputs, worker_ready);
+
+	return total_processed;
+}
+
+/*
  * Copy FROM logic handled by main process when using parallel copy.
  */
-static void CopyFromMain(CopyState cstate)
+static void
+CopyFromMain(CopyState cstate)
 {
 	ResultRelInfo *resultRelInfo;
 
@@ -4170,7 +3822,6 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
 					{
 						ereport(LOG, (errmsg("Worker couldn't send response to main.")));
 					}
-					ereport(LOG, (errmsg("Send successful, worker processed \"%lu\" tuples", processed)));
 
 					processed = 0;
 				}
@@ -4181,9 +3832,8 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
 				{
 					ereport(LOG, (errmsg("Worker couldn't receive message from main.")));
 				}
-				ereport(LOG, (errmsg("Receive successful, worker recieved \"%d\" tuples", *(int *) data)));
 
-				tuple_space = (HeapTuple) ((char *) shm_toc_lookup(toc, 8, false));
+				tuple_space = (HeapTuple) ((char *) shm_toc_lookup(toc, PARALLEL_KEY_TUPLES, false));
 				num_tuples_sent = *(int *) data;
 				has_more_tuples = num_tuples_sent != 0;
 				num_tuples_retrieved = 0;
@@ -4555,10 +4205,363 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
 	return processed;
 }
 
+static int
+SetupParallelCopyFrom(CopyState cstate, ParallelContext *pcxts[], shm_mq_handle *inputs[],
+					  shm_mq_handle *outputs[], HeapTuple tuple_spaces[], bool worker_ready[])
+{
+	Size tuplespace_size = (Size) cstate->shared_memory_size;
+	int nworkers_ready = 0;
+
+	for (int worker_num = 0; worker_num < cstate->num_workers; worker_num++) {
+		ParallelContext *pcxt;
+		Size tupledesc_size = TupleDescSize(cstate->rel->rd_att);
+		Form_pg_class relform_space;
+		TupleDesc tupledesc_space;
+		Relation rel_space;
+		char *attnumlist_data;
+		int attnumlist_len;
+		char *attnumlist_space;
+		char *rangetable_data;
+		int rangetable_len;
+		char *rangetable_space;
+		CopyState cstate_space;
+		shm_mq *inq;
+		shm_mq_handle *input;
+		shm_mq *outq;
+		shm_mq_handle *output;
+		HeapTuple tuple_space;
+
+		/* Create a parallel context. */
+		pcxt = CreateParallelContext("postgres", "ParallelCopyMain", 1, false);
+
+		/* Estimate space for Form_pg_class, needed for Relation. */
+		shm_toc_estimate_chunk(&pcxt->estimator, CLASS_TUPLE_SIZE);
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+		/* Estimate space for TupleDesc, needed for Relation. */
+		shm_toc_estimate_chunk(&pcxt->estimator, tupledesc_size);
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+		/* Estimate space for Relation, needed for CopyState. */
+		shm_toc_estimate_chunk(&pcxt->estimator, sizeof(RelationData));
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+		/* Estimate space for attnumlist, needed for CopyState. */
+		attnumlist_data = nodeToString(cstate->attnumlist);
+		attnumlist_len = strlen(attnumlist_data) + 1;
+		shm_toc_estimate_chunk(&pcxt->estimator, attnumlist_len);
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+		/* Estimate space for range_table, needed for CopyState. */
+		rangetable_data = nodeToString(cstate->range_table);
+		rangetable_len = strlen(rangetable_data) + 1;
+		shm_toc_estimate_chunk(&pcxt->estimator, rangetable_len);
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+		/* Estimate space for CopyState. */
+		shm_toc_estimate_chunk(&pcxt->estimator, sizeof(CopyStateData));
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+		/* Estimate space for in queue. */
+		shm_toc_estimate_chunk(&pcxt->estimator, QUEUE_SIZE);
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+		/* Estimate space for out queue. */
+		shm_toc_estimate_chunk(&pcxt->estimator, QUEUE_SIZE);
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+		/* Estimate space for tuple. */
+		shm_toc_estimate_chunk(&pcxt->estimator, tuplespace_size);
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+		/* Everyone's had a chance to ask for space, so now create the DSM. */
+		InitializeParallelDSM(pcxt);
+
+		/* Store Form_pg_class rd_rel. */
+		relform_space = (FormData_pg_class *) 
+				shm_toc_allocate(pcxt->toc, CLASS_TUPLE_SIZE);
+		memcpy(relform_space, cstate->rel->rd_rel, CLASS_TUPLE_SIZE);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_FORM_PG_CLASS, relform_space);
+
+		/* Store tuple desc. */
+		tupledesc_space = (TupleDesc)
+				shm_toc_allocate(pcxt->toc, tupledesc_size);
+		TupleDescCopy(tupledesc_space, cstate->rel->rd_att);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_TUPLE_DESC, tupledesc_space);
+
+		/* Store Relation rel. */
+		rel_space = (RelationData *)
+			shm_toc_allocate(pcxt->toc, sizeof(RelationData));
+		/* rel_space->rd_rel is set in ParallelCopyMain. */
+		/* rel_space->rd_att is set in ParallelCopyMain. */
+		rel_space->rd_id = cstate->rel->rd_id;
+		rel_space->rd_refcnt = cstate->rel->rd_refcnt;
+		rel_space->rd_isnailed = cstate->rel->rd_isnailed;
+		rel_space->rd_createSubid = cstate->rel->rd_createSubid;
+		rel_space->rd_newRelfilenodeSubid = cstate->rel->rd_newRelfilenodeSubid;
+		rel_space->rd_indexvalid = cstate->rel->rd_indexvalid;
+		rel_space->rd_isvalid = cstate->rel->rd_isvalid;
+		rel_space->rd_oidindex = cstate->rel->rd_oidindex;
+		rel_space->rd_pkindex = cstate->rel->rd_pkindex;
+		rel_space->rd_replidindex = cstate->rel->rd_replidindex;
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_RELATION, rel_space);
+		
+		/* Store List attnumlist. */
+		attnumlist_space = shm_toc_allocate(pcxt->toc, attnumlist_len);
+		memcpy(attnumlist_space, attnumlist_data, attnumlist_len);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_ATTNUMLIST, attnumlist_space);
+
+		/* Store List range_table. */
+		rangetable_space = shm_toc_allocate(pcxt->toc, rangetable_len);
+		memcpy(rangetable_space, rangetable_data, rangetable_len);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_RANGE_TABLE, rangetable_space);
+
+		/* Store CopyState, needed for CopyFromWorker. */
+		cstate_space = (CopyStateData *)
+				shm_toc_allocate(pcxt->toc, sizeof(CopyStateData));
+		/* cstate_space->rel is set in ParallelCopyMain. */
+		/* cstate->attnumlist is set in ParallelCopyMain. */
+		/* cstate->range_table is set in ParallelCopyMain. */
+		cstate_space->batch_size = cstate->batch_size;
+		cstate_space->freeze = cstate->freeze;
+		cstate_space->cur_relname = cstate->cur_relname;
+		cstate_space->cur_lineno = cstate->cur_lineno;
+		cstate_space->cur_attname = cstate->cur_attname;
+		cstate_space->cur_attval = cstate->cur_attval;
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_COPY_STATE, cstate_space);
+
+		/* Store inq. */
+		inq = shm_mq_create(shm_toc_allocate(pcxt->toc, QUEUE_SIZE), QUEUE_SIZE);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_INPUT_QUEUE, inq);
+		shm_mq_set_receiver(inq, MyProc);
+		input = shm_mq_attach(inq, pcxt->seg, NULL);
+		inputs[worker_num] = input;
+
+		/* Store outq. */
+		outq = shm_mq_create(shm_toc_allocate(pcxt->toc, QUEUE_SIZE), QUEUE_SIZE);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_OUTPUT_QUEUE, outq);
+		shm_mq_set_sender(outq, MyProc);
+		output = shm_mq_attach(outq, pcxt->seg, NULL);
+		outputs[worker_num] = output;
+
+		/* Store HeapTuples space. */
+		tuple_space = (HeapTuple) shm_toc_allocate(pcxt->toc, tuplespace_size);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_TUPLES, tuple_space);
+		tuple_spaces[worker_num] = tuple_space;
+
+		LaunchParallelWorkers(pcxt);
+
+		WaitForParallelWorkersToAttach(pcxt);
+
+		/* Store worker so we can destroy it later. */
+		pcxts[worker_num] = pcxt;
+
+		/* Track background workers that have successfully launched/attached. */
+		if (pcxt->nknown_attached_workers == 0) {
+			worker_ready[worker_num] = false;
+			continue;
+		}
+
+		/* Wait for workers to attach. */
+		for (;;)
+		{
+			CHECK_FOR_INTERRUPTS();
+			if (shm_mq_get_sender(inq) != NULL && shm_mq_get_receiver(outq) != NULL)
+			{
+				break;
+			}
+		}
+
+		worker_ready[worker_num] = true;
+		nworkers_ready++;
+	}
+
+	return nworkers_ready;
+}
+
+/*
+ * Get columns associated with the hash for a relation.
+ */
+static List*
+GetHashColumns(CopyState cstate) {
+	Oid dboid = YBCGetDatabaseOid(cstate->rel);
+	YBCPgTableDesc ybc_table_desc = NULL;
+
+	HandleYBStatus(YBCPgGetTableDesc(dboid, YbGetStorageRelid(cstate->rel), &ybc_table_desc));
+
+	List *attnums = cstate->attnumlist;
+	ListCell *cur;
+	List *hashColumns = NULL;
+
+	foreach(cur, attnums)
+	{
+		int attnum = lfirst_int(cur);
+		YBCPgColumnInfo column_info = {0};
+		HandleYBTableDescStatus(YBCPgGetColumnInfo(ybc_table_desc, attnum, &column_info),
+								ybc_table_desc);
+		if (column_info.is_hash)
+		{
+			hashColumns = lappend_int(hashColumns, attnum-1);
+		}
+	}
+
+	return hashColumns;
+}
+
+/*
+ * Get hash code given tuple values and nulls.
+ */
+static uint16
+GetTupleHashCode(CopyState cstate, List *hashColumns, Datum *values, bool *nulls)
+{
+	ListCell *cur;
+	TupleDesc tupDesc = RelationGetDescr(cstate->rel);
+	char *arg_buf;
+	size_t size = 0;
+
+	foreach(cur, hashColumns)
+	{
+			int index = lfirst_int(cur);
+			Oid argtype = TupleDescAttr(tupDesc, index)->atttypid;
+			if (unlikely(argtype == UNKNOWNOID))
+			{
+					ereport(ERROR,
+							(errcode(ERRCODE_INDETERMINATE_DATATYPE),
+							errmsg("undefined datatype given to yb_hash_code")));
+			}
+
+			size_t typesize;
+			const YBCPgTypeEntity *typeentity =
+							YbDataTypeFromOidMod(InvalidAttrNumber, argtype);
+			YBCStatus status = YBCGetDocDBKeySize(values[index], typeentity,
+							nulls[index], &typesize);
+			if (unlikely(!YBCStatusIsOK(status)))
+			{
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("Unsupported datatype given to yb_hash_code"),
+							errdetail("Only types supported by HASH key columns are allowed"),
+							errhint("Use explicit casts to ensure input types are as desired")));
+			}
+			size += typesize;
+	}
+
+	arg_buf = alloca(size);
+
+	char *arg_buf_pos = arg_buf;
+	size_t total_bytes = 0;
+
+	foreach(cur, hashColumns)
+	{
+			int index = lfirst_int(cur);
+			Oid argtype = TupleDescAttr(tupDesc, index)->atttypid;
+			const YBCPgTypeEntity *typeentity =
+							YbDataTypeFromOidMod(InvalidAttrNumber, argtype);
+			size_t written;
+			YBCStatus status = YBCAppendDatumToKey(values[index], typeentity,
+													nulls[index], arg_buf_pos, &written);
+			if (unlikely(!YBCStatusIsOK(status)))
+			{
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("Unsupported datatype given to yb_hash_code"),
+							errdetail("Only types supported by HASH key columns are allowed"),
+							errhint("Use explicit casts to ensure input types are as desired")));
+			}
+			arg_buf_pos += written;
+
+			total_bytes += written;
+	}
+
+	uint16_t hash_code = YBCCompoundHash(arg_buf, total_bytes);
+
+	return hash_code;
+}
+
+/*
+ * Send tuples to workers using shared memory.
+ * We might need to receive response from worker before sending next batch of tuples,
+ * so this function returns the amount of tuples processed by the worker.
+ */
+static uint64
+SendTuplesToWorker(HeapTuple **tuples, HeapTuple tuple_spaces[], shm_mq_handle *inputs[],
+					shm_mq_handle *outputs[], bool has_written[], int worker_num, int num_tuples)
+{
+	int processed = 0;
+
+	/* 
+	* If we've written to this worker before, we need to check the response before
+	* sending the next batch.
+	*/
+	if (has_written[worker_num])
+	{
+		shm_mq_result res;
+		Size		nbytes;
+		void	   *data;
+		res = shm_mq_receive(inputs[worker_num], &nbytes, &data, false);
+		if (res == SHM_MQ_SUCCESS)
+		{
+			processed += *(int *)data;
+		}
+		else
+		{
+			ereport(ERROR, (errmsg("Main worker could not receive response from background worker \"%d\".", worker_num)));
+		}
+	}
+
+	/* If no more space, send the current batch of tuples to the worker. */
+	HeapTuple tuple_address = tuple_spaces[worker_num];
+	for (int tuple_num = 0; tuple_num < num_tuples; tuple_num++)
+	{
+		heap_copytuple_into_shm(tuples[worker_num][tuple_num], tuple_address);
+		tuple_address = (HeapTuple) ((char *) tuple_address + HEAPTUPLESIZE + tuples[worker_num][tuple_num]->t_len);
+		heap_freetuple(tuples[worker_num][tuple_num]);
+	}
+
+	/* Signal to background worker that tuples are written. */
+	/* Main process will send number of tuples sent through the queue. */
+	/* Background worker will return the number of tuples processed through the quuee. */
+	/* Each pcxt will have one input and one output queue */
+	shm_mq_result res;
+	res = shm_mq_send(outputs[worker_num], sizeof(&num_tuples), &num_tuples, false);
+	if (res != SHM_MQ_SUCCESS)
+	{
+		ereport(ERROR, (errmsg("Send was not successful to worker \"%d\".", worker_num)));
+	}
+
+	has_written[worker_num] = true;
+
+	return processed;
+}
+
+/*
+ * Cleanup PARALLEL COPY.
+ */
+static void
+EndParallelCopyFrom(CopyState cstate, ParallelContext *pcxts[], shm_mq_handle *inputs[],
+					shm_mq_handle *outputs[], bool worker_ready[])
+{
+	for (int worker_num = 0; worker_num < cstate->num_workers; worker_num++)
+	{
+		if (worker_ready[worker_num])
+		{
+			WaitForParallelWorkersToFinish(pcxts[worker_num]);
+
+			shm_mq_detach(inputs[worker_num]);
+			shm_mq_detach(outputs[worker_num]);
+		}
+
+		DestroyParallelContext(pcxts[worker_num]);
+	}
+
+	ExitParallelMode();
+}
+
 /*
  * Background worker entry point for parallel copy.
  */
-void ParallelCopyMain(dsm_segment *seg, shm_toc *toc)
+void
+ParallelCopyMain(dsm_segment *seg, shm_toc *toc)
 {
 	Form_pg_class relationForm;
 	TupleDesc tupDesc;
@@ -4574,21 +4577,21 @@ void ParallelCopyMain(dsm_segment *seg, shm_toc *toc)
 	shm_mq_handle *output;
 
 	/* Retrieving data from shared memory. */
-	relationForm = shm_toc_lookup(toc, 0, false);
-	tupDesc = shm_toc_lookup(toc, 1, false);
-	rel = shm_toc_lookup(toc, 2, false);
-	attnumlist_space = shm_toc_lookup(toc, 3, false);
+	relationForm = shm_toc_lookup(toc, PARALLEL_KEY_FORM_PG_CLASS, false);
+	tupDesc = shm_toc_lookup(toc, PARALLEL_KEY_TUPLE_DESC, false);
+	rel = shm_toc_lookup(toc, PARALLEL_KEY_RELATION, false);
+	attnumlist_space = shm_toc_lookup(toc, PARALLEL_KEY_ATTNUMLIST, false);
 	attnumlist = (List *) attnumlist_space;
-	rangetable_space = shm_toc_lookup(toc, 4, false);
+	rangetable_space = shm_toc_lookup(toc, PARALLEL_KEY_RANGE_TABLE, false);
 	range_table = (List *) rangetable_space;
-	cstate = shm_toc_lookup(toc, 5, false);
+	cstate = shm_toc_lookup(toc, PARALLEL_KEY_COPY_STATE, false);
 
 	/* Attach to message queues. */
-	outq = (shm_mq *) shm_toc_lookup(toc, 6, false);
+	outq = (shm_mq *) shm_toc_lookup(toc, PARALLEL_KEY_INPUT_QUEUE, false);
 	shm_mq_set_sender(outq, MyProc);
 	output = shm_mq_attach(outq, seg, NULL);
 
-	inq = shm_toc_lookup(toc, 7, false);
+	inq = shm_toc_lookup(toc, PARALLEL_KEY_OUTPUT_QUEUE, false);
 	shm_mq_set_receiver(inq, MyProc);
 	input = shm_mq_attach(inq, seg, NULL);
 

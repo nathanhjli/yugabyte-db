@@ -22,8 +22,18 @@
 
 #define DEFAULT_BATCH_ROWS_PER_TRANSACTION  1000
 #define PARALLEL_KEY_TRANSACTION_STATE		UINT64CONST(0xFFFFFFFFFFFF0008)
+#define PARALLEL_KEY_FORM_PG_CLASS			0
+#define PARALLEL_KEY_TUPLE_DESC				1
+#define PARALLEL_KEY_RELATION				2
+#define PARALLEL_KEY_ATTNUMLIST				3
+#define PARALLEL_KEY_RANGE_TABLE			4
+#define PARALLEL_KEY_COPY_STATE				5
+#define PARALLEL_KEY_INPUT_QUEUE			6
+#define PARALLEL_KEY_OUTPUT_QUEUE			7
+#define PARALLEL_KEY_TUPLES					8
+#define QUEUE_SIZE							1000
 #define MIN_HASH_CODE						0
-#define MAX_HASH_CODE						65536
+#define MAX_HASH_CODE						65535
 
 /* CopyStateData is private in commands/copy.c */
 typedef struct CopyStateData *CopyState;
