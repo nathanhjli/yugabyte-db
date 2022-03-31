@@ -1286,7 +1286,7 @@ ParallelWorkerMain(Datum main_arg)
 	/* Look up fixed parallel state. */
 	fps = shm_toc_lookup(toc, PARALLEL_KEY_FIXED, false);
 	MyFixedParallelState = fps;
-	
+
 	/* Arrange to signal the leader if we exit. */
 	ParallelMasterPid = fps->parallel_master_pid;
 	ParallelMasterBackendId = fps->parallel_master_backend_id;

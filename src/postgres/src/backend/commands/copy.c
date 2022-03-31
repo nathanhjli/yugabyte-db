@@ -3261,7 +3261,7 @@ ParallelCopyFrom(CopyState cstate) {
 	 */
 	List *hashColumns = GetHashColumns(cstate);
 
-	/* 
+	/*
 	 * Estimating the maximum number of tuples we can possibly store.
 	 * Actual number of tuples will be smaller since we don't consider the header.
 	 */
@@ -3445,7 +3445,7 @@ CopyFromMain(CopyState cstate)
 /*
  * Copy FROM logic handled by background workers when using parallel copy.
  */
-static uint64 
+static uint64
 CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
 			   shm_mq_handle *input, shm_mq_handle *output)
 {
@@ -3680,7 +3680,7 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
 		if (!IsYBRelation(resultRelInfo->ri_RelationDesc))
 			ereport(WARNING,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 	 errmsg("Batched COPY is not supported on temporary tables. "
+				 errmsg("Batched COPY is not supported on temporary tables. "
 						"Defaulting to using one transaction for the entire copy."),
 				 errhint("Either copy onto non-temporary table or set rows_per_transaction "
 						 "option to `0` to disable batching and remove this warning.")));
@@ -3842,7 +3842,7 @@ CopyFromWorker(CopyState cstate, dsm_segment *seg, shm_toc *toc,
 
 			if (!has_more_tuples)
 				break;
-			
+
 			tuple = curtuple_address;
 			tuple->t_data = (HeapTupleHeader) ((char*) tuple + HEAPTUPLESIZE);
 
